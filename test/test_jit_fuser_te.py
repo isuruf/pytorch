@@ -1143,7 +1143,7 @@ class TestTEFuser(JitTestCase):
                 return torch.rand(shape, dtype=dtype, device=device)
             else:
                 # dtype is an integer.
-                return torch.randint(0, 100, shape, dtype=dtype, device=device)
+                return torch.randint(1, 4, shape, dtype=dtype, device=device)
             raise RuntimeError("Unhandled dtype")
 
         dtypes = [
@@ -1152,20 +1152,48 @@ class TestTEFuser(JitTestCase):
             torch.int16,
             torch.int32,
             torch.int64,
-            torch.float16,
-            torch.bfloat16,
+            # torch.float16,
+            # torch.bfloat16,
             torch.float32,
             torch.float64,
-            torch.bool,
-            torch.complex32,
-            torch.complex64,
-            torch.complex128,
-            torch.qint8,
-            torch.quint8,
-            torch.qint32,
+            # torch.bool,
+            # torch.complex32,
+            # torch.complex64,
+            # torch.complex128,
+            # torch.qint8,
+            # torch.quint8,
+            # torch.qint32,
         ]
         unary_ops = [
             torch.sigmoid,
+            torch.reciprocal,
+            torch.neg,
+            torch.relu,
+            torch.log,
+            torch.log10,
+            torch.log2,
+            torch.exp,
+            torch.expm1,
+            torch.erf,
+            torch.erfc,
+            torch.cos,
+            torch.sin,
+            torch.tan,
+            torch.acos,
+            torch.asin,
+            torch.cosh,
+            torch.sinh,
+            torch.atan,
+            torch.tanh,
+            torch.sqrt,
+            torch.rsqrt,
+            torch.abs,
+            torch.ceil,
+            torch.floor,
+            torch.round,
+            torch.trunc,
+            torch.frac,
+            torch.lgamma,
         ]
         devices = [
             "cuda",
@@ -1180,9 +1208,14 @@ class TestTEFuser(JitTestCase):
                 # neither does the fuser.  Catch everything to avoid needing to
                 # guess what errors might be thrown by eager.
                 continue
-            t = torch.jit.trace(fn, (x,))
-            self.assertEqual(ref, t(x))
-            self.assertAllFused(t.graph_for(x))
+            try:
+                t = torch.jit.trace(fn, (x,))
+                torch.testing.assert_allclose(ref, t(x))
+                self.assertAllFused(t.graph_for(x))
+            except Exception as e:
+                raise RuntimeError(" ".join([
+                    "Failed:", str(dtype), op.__name__, device
+                    ]))
 
 if __name__ == '__main__':
     run_tests()
