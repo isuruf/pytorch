@@ -7,6 +7,8 @@ future.
 
 from .adam import Adam
 from .adamw import AdamW
+from .sgd import SGD
 
 del adam
 del adamw
+del sgd

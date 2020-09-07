@@ -250,49 +250,51 @@ class TestOptim(TestCase):
         return [dict(params=bias, **kwargs)]
 
     def test_sgd(self):
-        self._test_basic_cases(
-            lambda weight, bias: optim.SGD([weight, bias], lr=1e-3)
-        )
-        self._test_basic_cases(
-            lambda weight, bias: optim.SGD(
-                self._build_params_dict(weight, bias, lr=1e-2),
-                lr=1e-3)
-        )
-        self._test_basic_cases(
-            lambda weight, bias: optim.SGD(
-                self._build_params_dict_single(weight, bias, lr=1e-2),
-                lr=1e-3)
-        )
-        self._test_basic_cases(
-            lambda weight, bias: optim.SGD(
-                self._build_params_dict_single(weight, bias, lr=1e-2))
-        )
-        self._test_basic_cases(
-            lambda weight, bias: optim.SGD([weight, bias], lr=1e-3),
-            [lambda opt: StepLR(opt, gamma=0.9, step_size=10)]
-        )
-        self._test_basic_cases(
-            lambda weight, bias: optim.SGD([weight, bias], lr=1e-3),
-            [lambda opt: StepLR(opt, gamma=0.9, step_size=10),
-             lambda opt: ReduceLROnPlateau(opt)]
-        )
-        self._test_basic_cases(
-            lambda weight, bias: optim.SGD([weight, bias], lr=1e-3),
-            [lambda opt: StepLR(opt, gamma=0.99, step_size=10),
-             lambda opt: ExponentialLR(opt, gamma=0.99),
-             lambda opt: ReduceLROnPlateau(opt)]
-        )
-        with self.assertRaisesRegex(ValueError, "Invalid momentum value: -0.5"):
-            optim.SGD(None, lr=1e-2, momentum=-0.5)
+        for optimizer in [optim.SGD, optim_mt.SGD]:
+            self._test_basic_cases(
+                lambda weight, bias: optimizer([weight, bias], lr=1e-3)
+            )
+            self._test_basic_cases(
+                lambda weight, bias: optimizer(
+                    self._build_params_dict(weight, bias, lr=1e-2),
+                    lr=1e-3)
+            )
+            self._test_basic_cases(
+                lambda weight, bias: optimizer(
+                    self._build_params_dict_single(weight, bias, lr=1e-2),
+                    lr=1e-3)
+            )
+            self._test_basic_cases(
+                lambda weight, bias: optimizer(
+                    self._build_params_dict_single(weight, bias, lr=1e-2))
+            )
+            self._test_basic_cases(
+                lambda weight, bias: optimizer([weight, bias], lr=1e-3),
+                [lambda opt: StepLR(opt, gamma=0.9, step_size=10)]
+            )
+            self._test_basic_cases(
+                lambda weight, bias: optimizer([weight, bias], lr=1e-3),
+                [lambda opt: StepLR(opt, gamma=0.9, step_size=10),
+                lambda opt: ReduceLROnPlateau(opt)]
+            )
+            self._test_basic_cases(
+                lambda weight, bias: optimizer([weight, bias], lr=1e-3),
+                [lambda opt: StepLR(opt, gamma=0.99, step_size=10),
+                lambda opt: ExponentialLR(opt, gamma=0.99),
+                lambda opt: ReduceLROnPlateau(opt)]
+            )
+            with self.assertRaisesRegex(ValueError, "Invalid momentum value: -0.5"):
+                optimizer(None, lr=1e-2, momentum=-0.5)
 
     def test_sgd_sparse(self):
-        self._test_rosenbrock_sparse(
-            lambda params: optim.SGD(params, lr=5e-3)
-        )
-        self._test_rosenbrock_sparse(
-            lambda params: optim.SGD(params, lr=0.005),
-            [lambda opt: StepLR(opt, gamma=0.99999, step_size=300)]
-        )
+        for optimizer in [optim.SGD, optim_mt.SGD]:
+            self._test_rosenbrock_sparse(
+                lambda params: optimizer(params, lr=5e-3)
+            )
+            self._test_rosenbrock_sparse(
+                lambda params: optimizer(params, lr=0.005),
+                [lambda opt: StepLR(opt, gamma=0.99999, step_size=300)]
+            )
 
     def test_adam(self):
         for optimizer in [optim.Adam, optim_mt.Adam]:
