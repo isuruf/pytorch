@@ -339,17 +339,18 @@ class TestOptim(TestCase):
                 optimizer(None, lr=1e-2, weight_decay=-1)
 
     def test_adamw(self):
-        self._test_basic_cases(
-            lambda weight, bias: optim.AdamW([weight, bias], lr=1e-3)
-        )
-        self._test_basic_cases(
-            lambda weight, bias: optim.AdamW(
-                self._build_params_dict(weight, bias, lr=1e-2),
-                lr=1e-3)
-        )
+        for optimizer in [optim.AdamW, optim_mt.AdamW]:
+            self._test_basic_cases(
+                lambda weight, bias: optimizer([weight, bias], lr=1e-3)
+            )
+            self._test_basic_cases(
+                lambda weight, bias: optimizer(
+                    self._build_params_dict(weight, bias, lr=1e-2),
+                    lr=1e-3)
+            )
 
-        with self.assertRaisesRegex(ValueError, "Invalid weight_decay value: -1"):
-            optim.AdamW(None, lr=1e-2, weight_decay=-1)
+            with self.assertRaisesRegex(ValueError, "Invalid weight_decay value: -1"):
+                optimizer(None, lr=1e-2, weight_decay=-1)
 
     def test_sparse_adam(self):
         self._test_rosenbrock_sparse(

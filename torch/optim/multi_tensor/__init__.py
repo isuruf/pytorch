@@ -6,5 +6,7 @@ future.
 """
 
 from .adam import Adam
+from .adamw import AdamW
 
 del adam
+del adamw
