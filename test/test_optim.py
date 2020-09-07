@@ -478,16 +478,17 @@ class TestOptim(TestCase):
             optim.ASGD(None, lr=1e-2, weight_decay=-0.5)
 
     def test_rprop(self):
-        self._test_basic_cases(
-            lambda weight, bias: optim.Rprop([weight, bias], lr=1e-3)
-        )
-        self._test_basic_cases(
-            lambda weight, bias: optim.Rprop(
-                self._build_params_dict(weight, bias, lr=1e-2),
-                lr=1e-3)
-        )
-        with self.assertRaisesRegex(ValueError, "Invalid eta values: 1.0, 0.5"):
-            optim.Rprop(None, lr=1e-2, etas=(1.0, 0.5))
+        for optimizer in [optim.Rprop, optim_mt.Rprop]:
+            self._test_basic_cases(
+                lambda weight, bias: optimizer([weight, bias], lr=1e-3)
+            )
+            self._test_basic_cases(
+                lambda weight, bias: optimizer(
+                    self._build_params_dict(weight, bias, lr=1e-2),
+                    lr=1e-3)
+            )
+            with self.assertRaisesRegex(ValueError, "Invalid eta values: 1.0, 0.5"):
+                optimizer(None, lr=1e-2, etas=(1.0, 0.5))
 
     def test_lbfgs(self):
         self._test_basic_cases(

@@ -9,8 +9,10 @@ from .adam import Adam
 from .adamw import AdamW
 from .sgd import SGD
 from .rmsprop import RMSprop
+from .rprop import Rprop
 
 del adam
 del adamw
 del sgd
 del rmsprop
+del rprop
