@@ -11,6 +11,7 @@ from .sgd import SGD
 from .rmsprop import RMSprop
 from .rprop import Rprop
 from .asgd import ASGD
+from .adamax import Adamax
 
 del adam
 del adamw
@@ -18,3 +19,4 @@ del sgd
 del rmsprop
 del rprop
 del asgd
+del adamax
