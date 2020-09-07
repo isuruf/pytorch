@@ -466,16 +466,17 @@ class TestOptim(TestCase):
                 optimizer(None, lr=1e-2, momentum=-1.0)
 
     def test_asgd(self):
-        self._test_basic_cases(
-            lambda weight, bias: optim.ASGD([weight, bias], lr=1e-3, t0=100)
-        )
-        self._test_basic_cases(
-            lambda weight, bias: optim.ASGD(
-                self._build_params_dict(weight, bias, lr=1e-2),
-                lr=1e-3, t0=100)
-        )
-        with self.assertRaisesRegex(ValueError, "Invalid weight_decay value: -0.5"):
-            optim.ASGD(None, lr=1e-2, weight_decay=-0.5)
+        for optimizer in [optim.ASGD, optim_mt.ASGD]:
+            self._test_basic_cases(
+                lambda weight, bias: optimizer([weight, bias], lr=1e-3, t0=100)
+            )
+            self._test_basic_cases(
+                lambda weight, bias: optimizer(
+                    self._build_params_dict(weight, bias, lr=1e-2),
+                    lr=1e-3, t0=100)
+            )
+            with self.assertRaisesRegex(ValueError, "Invalid weight_decay value: -0.5"):
+                optimizer(None, lr=1e-2, weight_decay=-0.5)
 
     def test_rprop(self):
         for optimizer in [optim.Rprop, optim_mt.Rprop]:
