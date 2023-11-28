@@ -302,6 +302,7 @@ def core_aten_decompositions() -> Dict[torch._ops.OperatorBase, Callable]:
             aten.gelu_backward,
             aten.glu,
             aten.glu_backward,
+            aten.grid_sampler_2d_backward,
             aten.hardshrink,
             aten.hardsigmoid,
             aten.hardsigmoid_,

@@ -3747,6 +3747,216 @@ def grid_sampler_2d(
     )
 
 
+@out_wrapper("out0", "out1")
+@register_decomposition(aten.grid_sampler_2d_backward)
+@pw_cast_for_opmath
+def grid_sampler_2d_backward(
+    grad_output: Tensor,
+    input: Tensor,
+    grid: Tensor,
+    interpolation_mode: int,
+    padding_mode: int,
+    align_corners: bool,
+    output_mask: List[bool],
+) -> Tuple[Tensor, Tensor]:
+    torch._check(
+        interpolation_mode in (0, 1, 2),
+        lambda: f"Invalid interpolation mode {interpolation_mode}",
+    )
+    torch._check(
+        padding_mode in (0, 1, 2), lambda: f"Invalid padding mode {padding_mode}"
+    )
+
+    def unnormalize(coords: Tensor, size: int) -> (Tensor, float):
+        # Rescale coordinates from [-1, 1] to:
+        #   [0, size - 1] if align_corners is True
+        #   [-.5, size -.5] if align_corners is False
+        grad_in = (size * 0.5 - 0.5) if align_corners else (size * 0.5)
+        out = (
+            ((coords + 1) / 2) * (size - 1)
+            if align_corners
+            else ((coords + 1) * size - 1) / 2
+        )
+        return out, grad_in
+
+    def reflect_coordinates(
+        coord: Tensor, twice_low: int, twice_high: int
+    ) -> (Tensor, Tensor):
+        if twice_low == twice_high:
+            return torch.zeros_like(coord), torch.zeros_like(coord)
+        coord_min = twice_low / 2
+        span = (twice_high - twice_low) / 2
+        coord = coord - coord_min
+        grad_in_mult = torch.where(
+            coord < 0, -torch.ones_like(coord), torch.ones_like(coord)
+        )
+        coord = coord.abs()
+
+        extra = torch.fmod(coord, span)
+        flips = (coord / span).floor().to(dtype=torch.int8)
+
+        grad = torch.where(flips & 1 == 0, grad_in_mult, -grad_in_mult)
+        res = torch.where(flips & 1 == 0, extra + coord_min, span - extra + coord_min)
+        return res, grad
+
+    def clip_coordinates(coord: Tensor, clip_limit: int) -> (Tensor, Tensor):
+        coord_max = clip_limit - 1
+
+        res = torch.where(
+            coord <= 0,
+            torch.zeros_like(coord),
+            torch.where(coord >= coord_max, torch.ones_like(coord) * coord_max, coord),
+        )
+        grad = torch.where(
+            coord <= 0,
+            torch.zeros_like(coord),
+            torch.where(
+                coord >= coord_max, torch.zeros_like(coord), torch.ones_like(coord)
+            ),
+        )
+        return res, grad
+
+    def compute_source_index(coord: Tensor, size: int) -> (Tensor, Tensor):
+        coord, grad_in = unnormalize(coord, size)
+        if padding_mode == 1:  # Borders
+            coord, grad_clip = clip_coordinates(coord, size)
+            grad_in = grad_in * grad_clip
+        elif padding_mode == 2:  # Reflection
+            if align_corners:
+                coord, grad_refl = reflect_coordinates(coord, 0, 2 * (size - 1))
+            else:
+                coord, grad_refl = reflect_coordinates(coord, -1, 2 * size - 1)
+            coord, grad_clip = clip_coordinates(coord, size)
+            grad_in = grad_in * grad_refl * grad_clip
+        return coord, grad_in
+
+    grad_input = torch.zeros_like(input, memory_format=torch.contiguous_format)
+    grad_grid = torch.empty_like(grid, memory_format=torch.contiguous_format)
+
+    input_requires_grad = output_mask[0]
+
+    if grid.numel() == 0 or input.numel() == 0:
+        grad_grid.zeros_()
+        if not input_requires_grad:
+            grad_input = torch.new_zeros([])
+        return grad_input, grad_grid
+
+    if interpolation_mode == 1:  # Nearest
+        grad_grid.zeros_()
+
+    N, C, iH, iW = input.shape
+    _, oH, oW, two = grid.shape
+    assert two == 2
+
+    def in_bounds_cond(xs: Tensor, ys: Tensor) -> Tensor:
+        return torch.logical_and(
+            0 <= xs, torch.logical_and(xs < iW, torch.logical_and(0 <= ys, ys < iH))
+        )
+
+    N_idx = torch.arange(N, device=input.device).view(N, 1, 1, 1)
+    C_idx = torch.arange(C, device=input.device).view(1, C, 1, 1)
+    H_idx = torch.arange(iH, device=input.device).view(1, 1, iH, 1)
+    W_idx = torch.arange(iW, device=input.device).view(1, 1, 1, iW)
+    xy_idx = torch.arange(2, device=input.device).view(1, 1, 1, 1, 2)
+
+    def clip(xs: Tensor, ys: Tensor, ws: Tensor) -> TensorSequenceType:
+        cond = in_bounds_cond(xs, ys)
+        # To clip to inside valid coordinates, we map the coordinates
+        # to (x, y) = (0, 0) and also set the weight to 0
+        # We also change the shape of the tensor to the appropriate one for
+        # broadcasting with N_idx, C_idx for the purposes of advanced indexing
+        return tuple(
+            torch.where(cond, t, 0).view(N, 1, oH, oW)
+            for t in (xs.to(dtype=torch.int64), ys.to(dtype=torch.int64), ws)
+        )
+
+    def get_summand2(ix: Tensor, iy: Tensor, w1, w2, t1: Tensor, t2: Tensor) -> Tensor:
+        # Perform clipping, index into input tensor and multiply by weight
+        idx_x, idx_y, w1_ = clip(ix, iy, w1)
+        _, _, w2_ = clip(ix, iy, w2)
+        return (
+            t1[N_idx, C_idx, idx_y, idx_x].expand(N, C, oH, oW, 2)
+            * t2[N_idx, C_idx, idx_y, idx_x].expand(N, C, oH, oW, 2)
+            * torch.where(xy_idx == 0, w1_, w2_)
+        )
+
+    x = grid[..., 0]
+    y = grid[..., 1]
+
+    ix, gix_mult = compute_source_index(x, iW)
+    iy, giy_mult = compute_source_index(y, iH)
+    print(ix.shape, iW)
+
+    if interpolation_mode == 0:  # Bilinear
+        ix_nw, iy_nw = ix.floor(), iy.floor()
+        ix_ne, iy_ne = ix_nw + 1, iy_nw
+        ix_sw, iy_sw = ix_nw, iy_nw + 1
+        ix_se, iy_se = ix_nw + 1, iy_nw + 1
+
+        w_nw = (ix_se - ix) * (iy_se - iy)
+        w_ne = (ix - ix_sw) * (iy_sw - iy)
+        w_sw = (ix_ne - ix) * (iy - iy_ne)
+        w_se = (ix - ix_nw) * (iy - iy_nw)
+
+        for ix, iy, w in (
+            (ix_nw, iy_nw, w_nw),
+            (ix_ne, iy_ne, w_ne),
+            (ix_sw, iy_sw, w_sw),
+            (ix_se, iy_se, w_se),
+        ):
+            # Perform clipping, index into input tensor and multiply by weight
+            idx_x, idx_y, w_ = clip(ix, iy, w)
+            grad_input.index_put_(
+                (N_idx, C_idx, idx_y, idx_x),
+                grad_output[N_idx, C_idx, :, :] * w_,
+                accumulate=True,
+            )
+
+        grad_grid = _sum_tensors(
+            get_summand2(ix, iy, w1, w2, grad_input, grad_output)
+            for (ix, iy, w1, w2) in (
+                (ix_nw, iy_nw, -w_nw * (iy_se - iy), -w_nw * (ix_se - ix)),
+                (ix_ne, iy_ne, w_ne * (iy_sw - iy), -w_ne * (ix - ix_sw)),
+                (ix_sw, iy_sw, -w_sw * (iy - iy_ne), w_sw * (ix_ne - ix)),
+                (ix_se, iy_se, w_se * (iy - iy_nw), w_se * (ix - ix_nw)),
+            )
+        ).sum(dim=1) * torch.where(xy_idx == 0, gix_mult, giy_mult)
+        # grad_grid0 = _sum_tensors(
+        #     get_summand(ix, iy, w, grad_input, grad_output)
+        #     for (ix, iy, w) in (
+        #         (ix_nw, iy_nw, -w_nw*(iy_se - iy)),
+        #         (ix_ne, iy_ne, w_ne*(iy_sw - iy)),
+        #         (ix_sw, iy_sw, -w_sw*(iy - iy_ne)),
+        #         (ix_se, iy_se, w_se*(iy - iy_nw)),
+        #     )
+        # ).sum(dim=1) * gix_mult
+
+        # grad_grid1 = _sum_tensors(
+        #     get_summand(ix, iy, w, grad_input, grad_output)
+        #     for (ix, iy, w) in (
+        #         (ix_nw, iy_nw, -w_nw*(ix_se - ix)),
+        #         (ix_ne, iy_ne, -w_ne*(ix - ix_sw)),
+        #         (ix_sw, iy_sw, w_sw*(ix_ne - ix)),
+        #         (ix_se, iy_se, w_se*(ix - ix_nw)),
+        #     )
+        # ).sum(dim=1) * giy_mult
+        # grad_grid[..., 0] = grad_grid0
+        # grad_grid[..., 1] = grad_grid1
+
+    elif interpolation_mode == 1:  # Nearest
+        ix_nearest = ix.round()
+        iy_nearest = iy.round()
+
+        grad_input = get_summand(
+            ix_nearest, iy_nearest, grad_output[N_idx, C_idx, H_idx, W_idx]
+        )
+
+    if not input_requires_grad:
+        grad_input = grad_input.new_zeros([])
+
+    return grad_input, grad_grid
+
+
 @register_decomposition(aten.mv)
 @out_wrapper()
 @pw_cast_for_opmath
