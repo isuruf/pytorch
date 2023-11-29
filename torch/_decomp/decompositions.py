@@ -3264,6 +3264,60 @@ def upsample_bilinear2d_vec(input, output_size, align_corners, scale_factors):
     return upsample_bilinear2d(input, osize, align_corners, scale_h, scale_w)
 
 
+@register_decomposition(aten.upsample_linear1d.default)
+@aten.upsample_linear1d.default.py_impl(DispatchKey.Autograd)
+@pw_cast_for_opmath
+def upsample_bilinear2d(
+    input: Tensor,
+    output_size: List[int],
+    align_corners: bool,
+    scales_w: Optional[float] = None,
+) -> Tensor:
+    # get dimensions of original image
+    n_batch, n_channels, in_w = input.shape
+
+    out_w = output_size[0]
+
+    # Calculate vertical scaling factor
+    # TODO: Figure out if scales_w matters here
+    if out_w > 1:
+        if align_corners:
+            w_scale_factor = (in_w - 1) / (out_w - 1)
+        else:
+            w_scale_factor = 1.0 / scales_w if scales_w is not None else in_w / out_w
+    else:
+        w_scale_factor = 0.0
+
+    i = torch.arange(out_w, dtype=input.dtype, device=input.device)
+
+    if align_corners:
+        x = w_scale_factor * i
+    else:
+        x = (w_scale_factor * (i + 0.5) - 0.5).clamp(min=0.0)
+
+    x_floor = x.to(torch.int64)
+    x_ceil = torch.ceil(x).clamp(max=in_w - 1).to(torch.int64)
+
+    x_view = x.unsqueeze(1)
+    x_floor_view = x_floor.unsqueeze(1)
+    x_ceil_view = x_ceil.unsqueeze(1)
+
+    v1 = aten._unsafe_index(input, [None, None, x_floor_view])
+    v2 = aten._unsafe_index(input, [None, None, x_ceil_view])
+
+    xscale2 = x_view - x_floor_view
+    xscale1 = 1.0 - xscale2
+
+    result = torch.mul(v1, xscale1) + torch.mul(v2, xscale2)
+
+    # convert output to correct memory format, if necessary
+    memory_format = utils.suggest_memory_format(input)
+
+    result = result.contiguous(memory_format=memory_format)
+
+    return result
+
+
 @register_decomposition(aten.upsample_bilinear2d.default)
 @aten.upsample_bilinear2d.default.py_impl(DispatchKey.Autograd)
 @pw_cast_for_opmath

@@ -429,6 +429,7 @@ def core_aten_decompositions() -> Dict[torch._ops.OperatorBase, Callable]:
             aten.unsafe_split.Tensor,
             aten.unsafe_split_with_sizes,
             aten._unsafe_view,
+            aten.upsample_linear1d,
             aten.upsample_bilinear2d,
             aten.upsample_nearest2d_backward,
             aten.view_as_complex,
