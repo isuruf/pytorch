@@ -119,6 +119,7 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
 
     gm.recompile()
     gm.graph.lint()
+    print(gm.graph)
 
 
 @init_once_fakemode
