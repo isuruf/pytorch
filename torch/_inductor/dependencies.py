@@ -119,11 +119,16 @@ class StarDep(typing.NamedTuple):
 # they can be fused together
 class AccumulateDep(typing.NamedTuple):
     # depends on the entire buffer
-    name: str
+    dep: Dep
     mode: Optional[str]
 
     @property
+    def name(self):
+        return self.dep.name
+
+    @property
     def index(self):
+        return self.dep.index
         raise NotImplementedError("AccumulateDep does not have an index")
 
     def get_numel(self) -> sympy.Expr:
@@ -131,7 +136,7 @@ class AccumulateDep(typing.NamedTuple):
 
     def rename(self, renames: Dict[str, str]) -> "AccumulateDep":
         if self.name in renames:
-            return AccumulateDep(renames[self.name], self.mode)
+            return AccumulateDep(self.dep.rename(renames), self.mode)
         return self
 
     def numbytes_hint(self):
@@ -230,7 +235,7 @@ class ReadWrites:
             mode := next(iter(self.writes_with_mode.keys()))
         ):
             (writes,) = self.writes_with_mode.values()
-            return {AccumulateDep(write.name, mode) for write in writes}
+            return {AccumulateDep(write, mode) for write in writes}
         else:
             return set.union(*list(self.writes_with_mode.values()))
 

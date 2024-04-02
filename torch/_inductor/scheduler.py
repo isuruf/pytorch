@@ -1512,7 +1512,7 @@ class Scheduler:
                     iter(node.read_writes.writes_with_mode.keys())
                 ):
                     mode = next(iter(node.read_writes.writes_with_mode.keys()))
-                    node.add_mutation_dep(AccumulateDep(alt_name, mode))
+                    node.add_mutation_dep(AccumulateDep(StarDep(alt_name), mode))
                 else:
                     node.add_mutation_dep(StarDep(alt_name))
                 for other_node in name_to_users[alt_name].items:
