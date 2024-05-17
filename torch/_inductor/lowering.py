@@ -4520,7 +4520,7 @@ def _avg_poolnd(
     # to the previous algorithm which unrolled manually for <=25
     context = (
         config.patch(unroll_reductions_threshold=25)
-        if window_size <= 25
+        if window_size <= 0
         else contextlib.nullcontext()
     )
 
