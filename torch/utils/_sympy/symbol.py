@@ -13,7 +13,7 @@ in this file and seeing what breaks.
 """
 
 from enum import auto, Enum
-from typing import Sequence, Union
+from typing import Optional, Tuple, Union
 
 import sympy
 
@@ -76,20 +76,108 @@ prefix_str = {
 }
 
 
-def make_symbol(prefix: SymT, idx: int, **kwargs) -> sympy.Symbol:
-    # TODO: maybe put the assumptions here directly
-    return sympy.Symbol(f"{prefix_str[prefix]}{idx}", **kwargs)
+# A custom class to keep SymT prefix as an attribute.
+# The name also keeps the string form of the prefix as an attribute.
+class PrefixedSymbol(sympy.Symbol):
+    def __new__(
+        cls,
+        name: str,
+        prefix: SymT,
+        *,
+        integer: Optional[bool] = None,
+        nonnegative: Optional[bool] = None,
+        positive: Optional[bool] = None,
+        real: Optional[bool] = None,
+    ):
+        obj = sympy.Symbol.__new__(
+            cls,
+            name,
+            integer=integer,
+            nonnegative=nonnegative,
+            positive=positive,
+            real=real,
+        )
+        obj.prefix = prefix
+        return obj
+
+    def _hashable_content(self):
+        # since we use only 3 assumptions, we only check on those three instead of the
+        # full set of assumptions to avoid an expensive caching operation
+        return (
+            self.name,
+            self.prefix,
+            self.is_integer,
+            self.is_nonnegative,
+            self.is_positive,
+            self.is_real,
+        )
+
+    def __copy__(self):
+        cls = self.__class__
+        return cls.__new__(
+            cls,
+            name=self.name,
+            prefix=self.prefix,
+            integer=self.is_integer,
+            nonnegative=self.is_nonnegative,
+            positive=self.is_positive,
+            real=self.is_real,
+        )
+
+    def __deepcopy__(self, memo):
+        result = self.__copy__()
+        memo[id(self)] = result
+        return result
+
+
+def make_symbol(
+    prefix: SymT,
+    idx: int,
+    *,
+    integer: Optional[bool] = None,
+    nonnegative: Optional[bool] = None,
+    positive: Optional[bool] = None,
+    real: Optional[bool] = None,
+) -> sympy.Symbol:
+    return PrefixedSymbol(
+        f"{prefix_str[prefix]}{idx}",
+        prefix=prefix,
+        integer=integer,
+        nonnegative=nonnegative,
+        positive=positive,
+        real=real,
+    )
 
 
 # This type is a little wider than it should be, because free_symbols says
 # that it contains Basic, rather than Symbol
-def symbol_is_type(sym: sympy.Basic, prefix: Union[SymT, Sequence[SymT]]) -> bool:
-    assert isinstance(sym, sympy.Symbol)
-    name_str = sym.name.lower()  # Match capitalized names like XBLOCK, RBLOCK
-    if isinstance(prefix, SymT):
-        return name_str.startswith(prefix_str[prefix])
+def symbol_is_type(sym: sympy.Basic, prefix: Union[SymT, Tuple[SymT, ...]]) -> bool:
+    if isinstance(sym, PrefixedSymbol):
+        # This function is called a *lot* of times, so it needs to be fast
+        if type(prefix) is tuple:
+            # a list comprehension with any is slow
+            for p in prefix:
+                if sym.prefix == p:
+                    return True
+            return False
+        elif type(prefix) is SymT:
+            return sym.prefix == prefix
+        else:
+            raise ValueError(f"Unknown type for prefix: {type(prefix)}")
     else:
-        return name_str.startswith(tuple(prefix_str[p] for p in prefix))
+        assert isinstance(sym, sympy.Symbol)
+        # TODO: remove all these Symbols and use PrefixedSymbol
+        #       Hint: they are created by sympy_index_symbol
+        sym_name = sym.name.lower()
+        if type(prefix) is tuple:
+            for p in prefix:
+                if sym_name.startswith(prefix_str[p]):
+                    return True
+            return False
+        elif type(prefix) is SymT:
+            return sym_name.startswith(prefix_str[prefix])
+        else:
+            raise ValueError(f"Unknown type for prefix: {type(prefix)}")
 
 
 def free_symbol_is_type(e: sympy.Expr, prefix: SymT) -> bool:
