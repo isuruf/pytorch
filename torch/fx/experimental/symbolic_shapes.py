@@ -1476,7 +1476,7 @@ def fast_expand(expr):
 
     if expr.is_Pow:
         base, exp = expr.args
-        if exp.is_Integer:
+        if exp.is_Integer and base.is_Add:
             if exp > 1:
                 return sympy.expand_multinomial(expr, deep=False)
             elif exp < 0:
