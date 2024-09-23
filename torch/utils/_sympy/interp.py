@@ -108,9 +108,6 @@ def handlers():
     return HANDLERS
 
 
-ASSOCIATIVE_OPS = {"minimum", "maximum", "mul", "add", "and_", "or_"}
-
-
 def _run_sympy_handler(analysis, args, expr, index_dtype=torch.int64):
     # Special cases
     if isinstance(expr, sympy.Pow) and isinstance(
@@ -144,17 +141,9 @@ def _run_sympy_handler(analysis, args, expr, index_dtype=torch.int64):
         handler_name = handlers()[expr.func]
     handler = getattr(analysis, handler_name)
     try:
-        if handler_name in ASSOCIATIVE_OPS:
-            assert len(args) > 1
-            acc = handler(args[0], args[1])
-            for i in range(2, len(args)):
-                acc = handler(acc, args[i])
-            log.debug("%s(%s) -> %s", handler_name, args, acc)
-            return acc
-        else:
-            r = handler(*args)
-            log.debug("%s(%s) -> %s", handler_name, args, r)
-            return r
+        r = handler(*args)
+        log.debug("%s(%s) -> %s", handler_name, args, r)
+        return r
     except Exception:
         log.warning("failed while executing %s(%s)", handler_name, args)
         raise

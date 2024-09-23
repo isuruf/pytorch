@@ -13,11 +13,12 @@ from typing import (
     Optional,
     overload,
     SupportsFloat,
+    Tuple,
     TYPE_CHECKING,
     TypeVar,
     Union,
 )
-from typing_extensions import TypeGuard
+from typing_extensions import Protocol, TypeGuard
 
 import sympy
 from sympy.logic.boolalg import Boolean as SympyBoolean, BooleanAtom
@@ -116,6 +117,19 @@ BoolFn = Callable[[SympyBoolean], SympyBoolean]
 BoolFn2 = Callable[[SympyBoolean, SympyBoolean], SympyBoolean]
 AllFn = Union[ExprFn, BoolFn]
 AllFn2 = Union[ExprFn2, BoolFn2]
+
+
+class ExprFnN(Protocol):
+    def __call__(self, *args: sympy.Expr) -> sympy.Expr:
+        ...
+
+
+class BoolFnN(Protocol):
+    def __call__(self, *args: SympyBoolean) -> SympyBoolean:
+        ...
+
+
+AllFnN = Union[ExprFnN, BoolFnN]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -375,26 +389,23 @@ class ValueRanges(Generic[_T]):
     @overload
     @staticmethod
     def coordinatewise_increasing_map(
-        x: Union[ExprIn, ExprVR],
-        y: Union[ExprIn, ExprVR],
-        fn: ExprFn2,
+        xs: Tuple[Union[ExprIn, ExprVR], ...],
+        fn: ExprFnN,
     ) -> ExprVR:
         ...
 
     @overload
     @staticmethod
     def coordinatewise_increasing_map(  # type: ignore[misc]
-        x: Union[BoolIn, BoolVR],
-        y: Union[BoolIn, BoolVR],
-        fn: BoolFn2,
+        xs: Tuple[Union[BoolIn, BoolVR], ...],
+        fn: BoolFnN,
     ) -> BoolVR:
         ...
 
     @staticmethod
     def coordinatewise_increasing_map(
-        x: Union[AllIn, AllVR],
-        y: Union[AllIn, AllVR],
-        fn: AllFn2,
+        xs: Union[Tuple[Union[BoolIn, BoolVR], ...], Tuple[Union[ExprIn, ExprVR], ...]],
+        fn: AllFnN,
     ) -> AllVR:
         """
         It's increasing on each coordinate.
@@ -403,11 +414,12 @@ class ValueRanges(Generic[_T]):
         For every 1 <= i <= n and x_i <= y_i we have that
         f(x1, .., xn) <= f(x1, , yi, ..., xn)
         """
-        x, y = ValueRanges.wrap(x), ValueRanges.wrap(y)
-        return ValueRanges(
-            fn(x.lower, y.lower),  # type: ignore[arg-type]
-            fn(x.upper, y.upper),  # type: ignore[arg-type]
-        )
+        xs = [ValueRanges.wrap(x) for x in xs]
+        lower = tuple(x.lower for x in xs)
+        upper = tuple(x.upper for x in xs)
+        fn_lower = fn(*lower)  # type: ignore[arg-type]
+        fn_upper = fn(*upper)  # type: ignore[arg-type]
+        return ValueRanges(fn_lower, fn_upper)  # type: ignore[arg-type]
 
     @classmethod
     def coordinatewise_monotone_map(cls, x, y, fn):
@@ -486,12 +498,12 @@ class SymPyValueRangeAnalysis:
         return ValueRanges.decreasing_map(a, sympy.Not)
 
     @staticmethod
-    def or_(a, b):
-        return ValueRanges.coordinatewise_increasing_map(a, b, sympy.Or)
+    def or_(*args):
+        return ValueRanges.coordinatewise_increasing_map(args, sympy.Or)
 
     @staticmethod
-    def and_(a, b):
-        return ValueRanges.coordinatewise_increasing_map(a, b, sympy.And)
+    def and_(*args):
+        return ValueRanges.coordinatewise_increasing_map(args, sympy.And)
 
     @staticmethod
     def eq(a, b):
@@ -538,30 +550,36 @@ class SymPyValueRangeAnalysis:
         return cls.not_(cls.lt(a, b))
 
     @staticmethod
-    def add(a, b):
-        return ValueRanges.coordinatewise_increasing_map(
-            a, b, _keep_float(operator.add)
-        )
+    def add(*args):
+        return ValueRanges.coordinatewise_increasing_map(args, _keep_float(sympy.Add))
 
     @classmethod
-    def mul(cls, a, b):
-        a = ValueRanges.wrap(a)
-        b = ValueRanges.wrap(b)
+    def mul(cls, *args):
+        assert len(args) >= 2
+        args = list(map(ValueRanges.wrap, args))
 
-        assert a.is_bool == b.is_bool
-        if a.is_bool:
-            return cls.and_(a, b)
+        is_bool = args[0].is_bool
+        assert all(arg.is_bool == is_bool for arg in args[1:])
 
-        def safe_mul(a, b):
+        if is_bool:
+            return cls.and_(*args)
+
+        def safe_mul(*args):
             # Make unknown() * wrap(0.0) == wrap(0.0)
-            if a == 0.0 or a == 0:
-                return a
-            elif b == 0.0 or b == 0:
-                return b
-            else:
-                return a * b
+            for arg in args:
+                if arg == 0.0 or arg == 0:
+                    return arg
+            return sympy.Mul(*args)
 
-        return ValueRanges.coordinatewise_monotone_map(a, b, _keep_float(safe_mul))
+        result = ValueRanges.coordinatewise_monotone_map(
+            args[0], args[1], _keep_float(safe_mul)
+        )
+        for arg in args[2:]:
+            result = ValueRanges.coordinatewise_monotone_map(
+                result, arg, _keep_float(safe_mul)
+            )
+
+        return result
 
     @staticmethod
     def int_truediv(a, b):
@@ -664,7 +682,7 @@ class SymPyValueRangeAnalysis:
             # to replacements, so don't assert it, but DO clamp it to prevent
             # degenerate problems
             return ValueRanges.coordinatewise_increasing_map(
-                a, b & ValueRanges(0, int_oo), PowByNatural
+                (a, b & ValueRanges(0, int_oo)), PowByNatural
             )
         elif b.is_singleton():
             if b.lower % 2 == 0:
@@ -755,18 +773,17 @@ class SymPyValueRangeAnalysis:
         return ValueRanges.increasing_map(x, OpaqueUnaryFn_log)
 
     @classmethod
-    def minimum(cls, a, b):
-        return cls.min_or_max(a, b, sympy.Min)
+    def minimum(cls, *args):
+        return cls.min_or_max(args, sympy.Min)
 
     @classmethod
-    def maximum(cls, a, b):
-        return cls.min_or_max(a, b, sympy.Max)
+    def maximum(cls, *args):
+        return cls.min_or_max(args, sympy.Max)
 
     @staticmethod
-    def min_or_max(a, b, fn):
-        a = ValueRanges.wrap(a)
-        b = ValueRanges.wrap(b)
-        return ValueRanges.coordinatewise_increasing_map(a, b, fn)
+    def min_or_max(args, fn):
+        args = tuple(map(ValueRanges.wrap, args))
+        return ValueRanges.coordinatewise_increasing_map(args, fn)
 
     @classmethod
     def floor_to_int(cls, x, dtype):

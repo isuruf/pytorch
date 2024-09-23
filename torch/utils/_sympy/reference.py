@@ -1,6 +1,7 @@
 # mypy: allow-untyped-defs
 import math
 import operator
+from functools import reduce
 
 import sympy
 
@@ -37,12 +38,12 @@ class ReferenceAnalysis:
         return sympy.sympify(c)
 
     @staticmethod
-    def or_(a, b):
-        return a | b
+    def or_(*args):
+        return reduce(operator.or_, args)
 
     @staticmethod
-    def and_(a, b):
-        return a & b
+    def and_(*args):
+        return reduce(operator.and_, args)
 
     @staticmethod
     def eq(a, b):
@@ -138,12 +139,28 @@ class ReferenceAnalysis:
         raise NotImplementedError("TODO: truncdiv")
 
     @staticmethod
-    def add(a, b):
-        return _keep_float(operator.add)(a, b)
+    @_keep_float
+    def add(*args):
+        return ReferenceAnalysis.add_or_mul(args, sympy.Add, operator.add)
 
     @staticmethod
-    def mul(a, b):
-        return _keep_float(operator.mul)(a, b)
+    @_keep_float
+    def mul(*args):
+        return ReferenceAnalysis.add_or_mul(args, sympy.Mul, operator.mul)
+
+    @staticmethod
+    def add_or_mul(args, sympy_cls, op):
+        syms, others = [], []
+        for arg in args:
+            if isinstance(arg, sympy.Basic):
+                syms.append(arg)
+            else:
+                others.append(arg)
+        if syms:
+            return reduce(op, others) + sympy_cls(*syms)
+        else:
+            return reduce(op, others)
+
 
     @staticmethod
     def sub(a, b):
@@ -236,12 +253,12 @@ class PythonReferenceAnalysis(ReferenceAnalysis):
         return torch._sym_sqrt(x)  # type: ignore[attr-defined]
 
     @staticmethod
-    def minimum(a, b):
-        return torch.sym_min(a, b)
+    def minimum(*args):
+        return reduce(torch.sym_min, args)
 
     @staticmethod
-    def maximum(a, b):
-        return torch.sym_max(a, b)
+    def maximum(args):
+        return reduce(torch.sym_min, args)
 
     @staticmethod
     def floor_to_int(x, dtype):
