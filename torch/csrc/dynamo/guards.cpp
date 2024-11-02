@@ -3077,8 +3077,149 @@ class TupleGetItemGuardAccessor : public GuardAccessor {
   Py_ssize_t _index;
 };
 
+enum class TensorProperty {
+  SIZE = 0,
+  STRIDE = 1,
+  STORAGE_OFFSET = 2,
+};
+
+std::string to_string(TensorProperty prop) {
+  switch (prop) {
+    case TensorProperty::SIZE:
+      return "TensorProperty::SIZE";
+    case TensorProperty::STRIDE:
+      return "TensorProperty::STRIDE";
+    case TensorProperty::STORAGE_OFFSET:
+      return "TensorProperty::STORAGE_OFFSET";
+    default:
+      return "TensorProperty::Unknown";
+  }
+}
+
+TensorProperty get_tensor_property_from_py(const py::object& prop) {
+  static const py::object tensor_property_enum_class =
+      py::module_::import("torch._dynamo.source").attr("TensorProperty");
+  static const py::object tensor_property_size_enum =
+      tensor_property_enum_class.attr("SIZE");
+  static const py::object tensor_property_stride_enum =
+      tensor_property_enum_class.attr("STRIDE");
+  static const py::object tensor_property_storage_offset_enum =
+      tensor_property_enum_class.attr("STORAGE_OFFSET");
+  if (prop.is(tensor_property_size_enum)) {
+    return TensorProperty::SIZE;
+  } else if (prop.is(tensor_property_stride_enum)) {
+    return TensorProperty::STRIDE;
+  } else if (prop.is(tensor_property_storage_offset_enum)) {
+    return TensorProperty::STORAGE_OFFSET;
+  } else {
+    throw std::runtime_error("Unknown property");
+  }
+}
+
 /**
- * Represents tensor.grad acccessor.
+ * Represents tensor.size/shape/storage_offset acccessor.
+ */
+template <TensorProperty _prop>
+class TensorPropertyGuardAccessor : public GuardAccessor {
+ public:
+  TensorPropertyGuardAccessor(
+      RootGuardManager* root,
+      const py::object& index,
+      std::string source,
+      py::handle example_value,
+      py::handle guard_manager_enum)
+      : GuardAccessor(
+            root,
+            index,
+            std::move(source),
+            example_value,
+            guard_manager_enum) {
+    if (_prop != TensorProperty::STORAGE_OFFSET) {
+      _index = py::cast<Py_ssize_t>(
+          inde /
+
+          : Intentional duplication between check_nopybind and
+              //
+              eck_verbose_nopybind.bo check_nopybind(
+                  PyObject * obj, bool matches_dict_tag = false)
+
+                      ide { // borrowed ref
+      eck that its a tensor
+
+      THPVariable_CheckExact(obj) && !THPVariable_Check(obj)) {
+        n false;
+
+        ensor tensor = THPVariable_Unpack(obj);
+
+        _t value;
+    if (_prop == TensorProperty::SIZE
+            value = tensor.size(_index);
+      } else if (_prop == TensorProperty::STR
+
+        value = tensor.stride(_index);
+                      } else _ rop == TensorProperty::STORAGE_) {
+        va sor.storage_offset();
+
+        e {
+          th runtime_error("Unknown property");
+        }
+        PyObject* py_value PyLong_FromLongLong(value); // New reference
+        bool result = _guard_manager->check_nopybind(py_value);
+        Py_DECREF(py_value);
+        return result;
+      }
+
+      GuardDebugInfo check_verbose_nopybind(PyObject * obj)
+          override { // borrowed ref
+        // check that its a tensor
+        if (!THPVariable_CheckExact(obj) && !THPVariable_Check(obj)) {
+      return Gua(
+           a tensor" + get_source(), 0);
+        }
+        at::Tensor tensor = THPVariable_Unpack(obj);
+        int64_t value;
+        if (_prop == TensorPrope IZE)
+          va sor.size(_index);
+      } else if (_prop == TensorProp
+      STRI        va
+      sor.stride(_index);
+    } else if (_prop == TensorProperty:
+      GE_ O {
+      va sor.storage_offset();
+    } else {
+      rDebugInfo(
+          false, "unknown property", 0;
+    }
+
+    ct *py_value =P yLong romLongLong(value);  // New ref ence
+    GuardDebugInfo result = _guard_manager->check_verbose_nopybind(py_value);
+    Py_DECREF(py_value);
+    return result;
+  }
+
+  std::string repr() const override {
+    // Helpful when priting GuardManager tree structure.
+    return "TensorPropertyGuardAccessor<" + to_s
+        rin + ">(" + std::to_str
+
+
+ (_index)
+
+        )";
+  }
+ p
+        ivate:
+
+
+
+ size_t _
+  ;
+};
+
+/**
+ * Repr
+
+nts tensor.grad acccessor.
  */
 class GradGuardAccessor : public GuardAccessor {
  public:
@@ -4144,6 +4285,39 @@ PyObject* torch_c_dynamo_guards_init() {
           "list_getitem_manager",
           &GuardManager::get_child_manager<ListGetItemGuardAccessor>,
           py::arg("key"),
+          py::arg("source"),
+          py::arg("example_value"),
+          py::arg("guard_manager_enum"),
+          py::return_value_policy::reference)
+      // return by reference because GuardManager has the ownership of accessors
+      // and guard managers
+      .def(
+          "tensor_property_size_manager",
+          &GuardManage
+              anager<TensorProperty GuardAccessor<TensorProperty::SIZE>>,
+          py::arg("idx"),
+          py::arg("source"),
+          py::arg("example_value"),
+          py::arg("guard_manager_enum"),
+          py::return_value_policy::reference)
+      // return by reference because GuardManager has the ownership of accessors
+      // and guard managers
+      .def(
+          "tensor_property_stride_manager",
+          &GuardManage
+              anager<TensorProperty GuardAccessor<TensorProperty::STRIDE>>,
+          py::arg("idx"),
+          py::arg("source"),
+          py::arg("example_value"),
+          py::arg("guard_manager_enum"),
+          py::return_value_policy::reference)
+      // return by reference because GuardManager has the ownership of accessors
+      // and guard managers
+      .def(
+          "tensor_property_storage_offset_manager",
+          &GuardManage anager<
+              TensorProperty GuardAccessor<TensorProperty::STORAGE_OFFSET>>,
+          py::arg("idx"),
           py::arg("source"),
           py::arg("example_value"),
           py::arg("guard_manager_enum"),

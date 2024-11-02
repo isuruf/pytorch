@@ -955,6 +955,16 @@ class GuardBuilder(GuardBuilderBase):
                     example_value=example_value,
                     guard_manager_enum=guard_manager_enum,
                 )
+        elif istype(source, TensorPropertySource):
+            out = getattr(
+                base_guard_manager,
+                f"tensor_property_{source.prop.name.lower()}_manager",
+            )(
+                idx=source.idx,
+                source=source_name,
+                example_value=example_value,
+                guard_manager_enum=guard_manager_enum,
+            )
         elif istype(source, GetItemSource):
             assert base_guard_manager  # to make mypy happy
             if isinstance(base_example_value, (dict, collections.OrderedDict)):
@@ -1763,7 +1773,13 @@ class GuardBuilder(GuardBuilderBase):
             )
         else:
             equalities_inputs = None
-        code_parts, verbose_code_parts = output_graph.shape_env.produce_guards_verbose(
+        for a in fs:
+            print("fs", a.fake, a.source)
+        (
+            code_parts,
+            verbose_code_parts,
+            sympy_code_parts,
+        ) = output_graph.shape_env.produce_guards_verbose(
             [a.fake for a in fs],
             [a.source for a in fs],
             input_contexts=input_contexts,
@@ -1779,6 +1795,15 @@ class GuardBuilder(GuardBuilderBase):
 
         for code in code_parts:
             self._set_guard_export_info(guard, [code])
+
+        print(sympy_code_parts)
+        guard_managers = set()
+        for expr, symbols_to_sources in sympy_code_parts:
+            for symbol, sources in symbols_to_sources.items():
+                manager = self.get_guard_manager_from_source(sources[0])
+                guard_managers.add(manager)
+                print(manager)
+                print(sources[0], sources[0].name())
 
         # Install all the symbolic guards in one lambda guard. These are run
         # at the very end of the RootGuardManager via epilogue guards.
