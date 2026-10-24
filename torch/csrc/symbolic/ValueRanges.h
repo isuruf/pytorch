@@ -2,59 +2,43 @@
 
 #include <torch/csrc/symbolic/Expr.h>
 
-#include <unordered_map>
-
-// Port of torch/utils/_sympy/value_ranges.py.
+// Value range analysis in the spirit of torch/utils/_sympy/value_ranges.py,
+// for integer and boolean expressions.
 
 namespace torch::symbolic {
 
-// A ValueRanges whose bounds are numbers or BooleanTrue/BooleanFalse.
+// Integer bounds are Integers or +-int_oo; boolean bounds are true/false.
 struct ValueRanges {
-  // ValueRanges.__init__ for bounds that are already normalized: throws for an
-  // invalid range or one that make_value_range would change.
-  ValueRanges(const Expr* lower, const Expr* upper);
+  // Throws for an invalid range.
+  ValueRanges(Expr lower, Expr upper);
 
-  static bool is_int_bound(const Expr* e) {
-    return e->kind == Kind::Integer || e->kind == Kind::IntInfinity ||
-        e->kind == Kind::NegativeIntInfinity;
-  }
+  static ValueRanges boolean_range(bool can_be_false, bool can_be_true);
 
-  bool is_bool() const {
-    return lower->is_boolean();
-  }
-  bool is_int() const {
-    return is_int_bound(lower) && is_int_bound(upper);
-  }
+  bool is_bool() const;
+  bool is_int() const;
   bool is_singleton() const {
     return lower == upper;
   }
+  // For a boolean range.
+  bool can_be_true() const {
+    return upper == boolean(true);
+  }
+  bool can_be_false() const {
+    return lower == boolean(false);
+  }
 
-  const Expr* lower;
-  const Expr* upper;
+  Expr lower;
+  Expr upper;
 };
 
-// ValueRanges.__init__: [Integer, oo] becomes [Integer, int_oo] and
-// [-oo, Integer] becomes [-int_oo, Integer].
-ValueRanges make_value_range(
-    ExprArena& arena,
-    const Expr* lower,
-    const Expr* upper);
+using RangeMap = ExprMap<ValueRanges>;
 
-using RangeMap = std::unordered_map<const Expr*, ValueRanges>;
-
-// sympy_interp(SymPyValueRangeAnalysis, ranges, e,
-//              missing_handler=_default_symbol_range)
-ValueRanges value_range_interp(
-    ExprArena& arena,
-    const Expr* e,
-    const RangeMap& ranges);
-
-// bound_sympy(e, {**context_ranges, **ranges}), where context_ranges is the
-// TracingContext's shape_env.var_to_range.
+// The range of e given the ranges of its symbols. A symbol without a range
+// gets the range its facts imply. Throws NativeUnsupported for expressions
+// the analysis does not handle.
 ValueRanges bound_sympy(
-    ExprArena& arena,
-    const Expr* e,
+    const Expr& e,
     const RangeMap& ranges,
-    const RangeMap* context_ranges = nullptr);
+    const SymbolTable& symbols);
 
 } // namespace torch::symbolic

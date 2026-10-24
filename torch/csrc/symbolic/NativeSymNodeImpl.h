@@ -17,18 +17,17 @@ class NativeSymNodeImpl final : public c10::SymNodeImpl {
   // only from wrap_*.
   NativeSymNodeImpl(
       c10::intrusive_ptr<NativeShapeEnv> env,
-      const Expr* expr,
+      Expr expr,
       PyType pytype,
       Hint hint,
-      Hint constant = {},
-      bool optimized_summation = false);
+      Hint constant = {});
   ~NativeSymNodeImpl() override;
 
   const c10::intrusive_ptr<NativeShapeEnv>& env() const {
     return env_;
   }
   // SymNode._expr: before replacements.
-  const Expr* expr() const {
+  const Expr& expr() const {
     return expr_;
   }
   PyType pytype() const {
@@ -39,9 +38,6 @@ class NativeSymNodeImpl final : public c10::SymNodeImpl {
   }
   const Hint& constant() const {
     return constant_;
-  }
-  bool optimized_summation() const {
-    return optimized_summation_;
   }
 
   bool is_int() override {
@@ -189,15 +185,14 @@ class NativeSymNodeImpl final : public c10::SymNodeImpl {
       c10::ArrayRef<c10::SymNode> strides);
   c10::SymNode try_sym_sum(c10::ArrayRef<c10::SymNode> args);
   // ShapeEnv.evaluate_sym_node(self, fallback_value=fallback_value) where it
-  // returns without guarding, else nullptr.
-  const Expr* evaluate(std::optional<bool> fallback_value);
+  // returns without guarding, else None.
+  MaybeExpr evaluate(std::optional<bool> fallback_value);
 
   c10::intrusive_ptr<NativeShapeEnv> env_;
-  const Expr* expr_;
+  Expr expr_;
   PyType pytype_;
   Hint hint_;
   Hint constant_;
-  bool optimized_summation_;
 };
 
 } // namespace torch::symbolic

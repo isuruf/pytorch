@@ -27,15 +27,16 @@ leaving Python fully authoritative for anything that records guards.
 1. **Python stays authoritative for every ShapeEnv mutation.** C++ never appends a guard, runtime
    assert, axiom, replacement or range refinement. When C++ cannot give a definite answer that
    Python would also give without mutating state, it delegates to Python.
-2. **Native answers match Python's exactly.** The evaluator is a line-by-line port of Python's
-   static evaluation (`_maybe_evaluate_static`). It only runs while Python's caches cannot be
-   stale (the pristine gate, section 6).
-3. **Native expressions are structurally identical to sympy's.** Every construction rule is
-   ported line by line and differential-tested, so `to_sympy(native) == python_result` and
-   `str()` matches byte for byte.
+2. **Native answers are sound, not identical.** The evaluator answers only what it can prove
+   from the mirrored ranges, using its own value range analysis. It may prove more or less than
+   Python's `_maybe_evaluate_static`, but a definite native answer never contradicts Python's. It
+   only runs while Python's caches cannot be stale (the pristine gate, section 6).
+3. **Expressions are SymEngine's.** Native expressions are `SymEngine::Expression`s. They need not
+   be structurally identical to what sympy builds; whenever Python needs one, a visitor converts it
+   to the equivalent sympy expression.
 4. **Flag off is byte-identical.** Every edit outside `torch/csrc/symbolic/` sits behind
    `shape_env._native_env is not None` or `isinstance(x, _NativeSymNode)`.
-5. **Unsupported means fallback, not approximation.** A step that needs machinery the port lacks
+5. **Unsupported means fallback, not approximation.** A step that needs machinery the native side lacks
    throws `NativeUnsupported`. The op then reruns in Python and gives the exact Python result.
 
 ## 3. Component map
@@ -64,8 +65,8 @@ flowchart TB
     subgraph CORE["Native core: torch/csrc/symbolic/, pure C++"]
         NODE["<b>A symbolic integer in C++</b><br/>NativeSymNodeImpl<br/><i>holds an expression, the current value (hint) and a type</i>"]
         NSE["<b>Read-only copy of ShapeEnv</b><br/>NativeShapeEnv<br/><i>symbols and ranges, cache of op results,<br/>answers guard questions that need no new guard</i>"]
-        EXPR["<b>Expressions such as 4*s0 + 8</b><br/>Expr / ExprArena<br/><i>each distinct expression stored once, compared by pointer</i>"]
-        RULES["<b>C++ re-implementation of the sympy rules PyTorch uses</b><br/>simplification, facts, comparisons, FloorDiv/Mod/Max,<br/>printing, range math"]
+        EXPR["<b>Expressions such as 4*s0 + 8</b><br/>SymEngine::Expression<br/><i>reference counted, hashed and compared structurally</i>"]
+        RULES["<b>torch's functions and range math</b><br/>FloorDiv/Mod/PythonMod/PowByNatural as SymEngine<br/>FunctionWrappers, symbol facts, value ranges"]
     end
 
     CPPK["<b>C++ meta kernels and FakeTensor</b><br/><i>use SymInts through the normal c10 interface;<br/>they cannot tell the node is native</i>"]
@@ -84,22 +85,22 @@ flowchart TB
     NSE -- "before Python uses its caches:<br/>replay C++ answers so they match" --> SE
 ```
 
-### Files (about 12.6K lines of C++)
+### Files
 
 | layer | file | role |
 |---|---|---|
-| expressions | `Expr.h/.cpp` | `Expr` kinds, the hash-consing `ExprArena`, Integer/Rational/Float/oo/int_oo numbers, Symbol, Add/Mul/Pow construction |
-| | `Assumptions.cpp` | three-valued facts (`is_integer`, `is_positive`, `is_nonnegative`, ...) per kind, ported from sympy's `_eval_is_*` |
-| | `Relational.cpp` | Eq/Ne/Lt/Le/Gt/Ge evaluation, And/Or/Not, `canonicalize_bool_expr` |
-| | `Functions.cpp` | every class in `torch/utils/_sympy/functions.py` (FloorDiv, Mod, PythonMod, Max, Min, CeilDiv, PowByNatural, ModularIndexing, Where, OpaqueUnaryFn_*, ...) |
-| | `Expand.cpp`, `ExprTools.cpp`, `Sorting.cpp` | `safe_expand`, xreplace/free symbols/gcd, sympy `sort_key`/`ordered` |
-| | `Printer.cpp` | sympy StrPrinter port, so `str(node)` needs no sympy |
-| | `ValueRanges.h/.cpp` | `ValueRanges` and the `bound_sympy` handlers |
+| expressions | `Expr.h/.cpp` | `Expr = SymEngine::Expression`, int_oo, relationals decided through `rhs - lhs`, And/Or/Not, and the `SymbolTable` of symbol facts (integer, nonnegative, positive) that SymEngine symbols do not carry |
+| | `Functions.h/.cpp` | `TorchFunction`, a SymEngine `FunctionWrapper` per class of `torch/utils/_sympy/functions.py` that native nodes build (FloorDiv, CleanDiv, Mod, PythonMod, PowByNatural, IsNonOverlappingAndDenseIndicator), named after the sympy class; Max and Min are SymEngine's |
+| | `ValueRanges.h/.cpp` | interval analysis of integer and boolean expressions (`bound_sympy`) |
 | state | `NativeShapeEnv.h/.cpp` | mirrored ShapeEnv state, symop memo, static evaluator, pristine gate, replay log |
 | node | `NativeSymNodeImpl.h/.cpp` | the `c10::SymNodeImpl` subclass (about 57 overridden virtuals) |
 | bridge | `PyFallback.h` | declarations of the only ways the core reaches Python: `materialize`, `python_impl`, `proxy_dispatch`, `proxy_mode`, `live_nodes_changed`, `native_config_is_default` |
-| bindings | `python_symbolic.cpp` | `torch._C._symbolic` module: `_NativeSymNode`, `NativeShapeEnv`, `_Arena`, conversion, `PyFallback` definitions, stats and test hooks |
+| bindings | `python_symbolic.cpp` | `torch._C._symbolic` module: `_NativeSymNode`, `NativeShapeEnv`, `_Arena`, the SymEngine-to-sympy visitor and sympy-to-SymEngine conversion, `PyFallback` definitions and test hooks |
 | | `python_symint_glue.cpp` | `_SymGlueMethod`: C implementations of the `torch.SymInt`/`SymBool` dunders for native nodes |
+
+SymEngine comes from `cmake/External/symengine.cmake`: an installed SymEngine with
+`USE_SYSTEM_SYMENGINE=1`, else a static build of a pinned commit with Boost.Multiprecision
+integers (an installed Boost with `USE_SYSTEM_BOOSTMP=1`, else headers SymEngine downloads).
 
 The core is compiled into libtorch_python (`build_variables.bzl`) so that incremental rebuilds
 relink the smaller library and slow paths can call Python directly. The core includes no Python
@@ -156,7 +157,7 @@ flowchart TD
     SAME -- no --> FB["<b>Hand over to Python</b><br/>build a Python twin of s0 and run Python's multiply;<br/>the result is a Python node from here on<br/><i>materialize, fallback</i>"]
     SAME -- yes --> MEMO{"<b>4. Was this exact op computed before?</b><br/>cache keyed on (op, left expression, right expression)<br/><i>symop memo</i>"}
     MEMO -- yes --> NEW
-    MEMO -- no --> CONS["<b>5. Build the result expression</b><br/>apply the ported sympy rules, e.g.<br/>s0 * 4 becomes 4*s0, 4 * (s0 + 2) becomes 4*s0 + 8;<br/>pure C++, no Python"]
+    MEMO -- no --> CONS["<b>5. Build the result expression</b><br/>SymEngine arithmetic and torch's function rules,<br/>e.g. s0 * 4 becomes 4*s0, FloorDiv(4*s0 + 6, 4) becomes s0 + 1;<br/>pure C++, no Python"]
     CONS -- "needs a rule C++ does not implement" --> FB
     CONS -- ok --> NEW["<b>6-7. Create the result node</b><br/>expression 4*s0, value 512, type int;<br/>always a fresh node, as in Python"]
     NEW --> RET["<b>Return a SymInt to the caller</b><br/>built in C, no Python frame"]
@@ -165,12 +166,11 @@ flowchart TD
 ```
 
 Key points:
-- **Expressions are interned.** Each `NativeShapeEnv` owns an `ExprArena`. Structurally equal
-  expressions are the same `const Expr*`, so equality is a pointer compare and memo keys are pointer
-  triples.
+- **Expressions are SymEngine's.** They are reference counted and carry their hash, so memo keys
+  are expressions compared structurally. A node keeps its expression alive.
 - **Nodes are immutable and freshly allocated,** matching Python's identity semantics.
   `clone()` returns `this`.
-- **Locking:** one `std::mutex` per env guards the arena, memo and mirror. No Python call is made
+- **Locking:** one `std::mutex` per env guards the symbol table, memo and mirror. No Python call is made
   while it is held, to avoid a GIL/mutex deadlock.
 - **Proxy dispatch runs before any fallback decision,** so the SymInts reaching
   `handle_sym_dispatch` carry the original native nodes and proxy-slot lookups hit.
@@ -236,14 +236,15 @@ exactly the flag-off entries in the flag-off order. An empty flush is one C call
 `SymNode(expr=to_sympy(expr), shape_env, pytype, hint, constant, ...)` once per native node, with
 the GIL held, and caches it on the binding side. The cache entry is erased in the node's destructor
 if the node was ever materialized.
-- `to_sympy` is cached per `Expr` id. Conversion is pure, so the cache never goes stale.
+- `to_sympy` is a SymEngine visitor that builds the sympy objects through pybind11, cached per
+  expression. Conversion is pure, so the cache never goes stale. Symbols convert back to the sympy
+  Symbol objects they came from.
 - Delegated ops call the Python method on the materialized node(s), and the result is a Python
   node.
 - Every materialization and delegation is counted by reason (`torch._C._symbolic._stats()`).
 
-About 180 `NativeUnsupported` sites exist. The main causes are eval steps needing general
-`sympy.gcd`/`simplify`, `zoo`/`nan`/complex results, int64 overflow, non-53-bit Floats and sort-key
-ties.
+Unsupported steps include zero divisors, int_oo arithmetic, Floats, sympy classes without a native
+counterpart and value ranges the analysis does not cover.
 
 ## 8. Python integration
 
@@ -268,34 +269,33 @@ ties.
   removed the roughly 1.9M `_make_user_magic` calls.
 - **Casters.** `utils/pybind.cpp` and `utils/python_symnode.{h,cpp}` accept native nodes as
   operands and build `SymBool`/`SymInt` objects for them.
-- **Lifetime.** Native nodes hold an `intrusive_ptr<NativeShapeEnv>`, so the arena outlives
+- **Lifetime.** Native nodes hold an `intrusive_ptr<NativeShapeEnv>`, so the symbol table outlives
   every node. The binding keeps a strong reference to the Python `ShapeEnv` only while live native
   nodes exist; an atomic count toggles it on the 0 <-> 1 transitions. A permanent reference would
   create an uncollectable cycle through `_native_env`.
 
 ## 9. Verification strategy
 
-- **`test/test_native_symnode.py`** (about 5.7K lines, 19 classes). For every construction rule,
-  fact, relational, function, printer case and value-range handler, the test builds the
-  expression natively and in sympy, then asserts `to_sympy(native) == sympy` and
-  `str(native) == str(sympy)`. Inputs include the 320-op Qwen corpus and seeded random expression
-  trees.
+- **`test/test_native_symnode.py`.** Expressions: sympy round trips, torch's functions against
+  their sympy classes on numbers and, at sampled points, on random expression trees, and value
+  ranges that must contain every sampled value. The evaluator: a definite native answer must hold
+  at sampled points and agree with Python's when Python is definite.
 - **Node level:** native vs Python `SymNode` for every virtual (hint, pytype, result expr, guard
   results, no extra guards recorded, overflow fallback, mixed operands), plus make_fx traces that
   must give identical graphs.
 - **Evaluator:** the same query stream goes to both evaluators, in pristine and non-pristine
-  states. The native answer must equal Python's or delegate, never differ.
+  states. When both answer definitely, the answers must be equal.
 - **Glue:** twin native ShapeEnvs run identical random op sequences through the descriptors and
   through the saved originals, comparing results, guards and replay logs.
-- Each C++ semantic change was also cross-checked by a separate reviewer agent running its own
-  differential fuzzers (often 0.5-1M checks per item).
 - **Debug mode:** `TORCH_NATIVE_SYMNODE_CHECK=1` asserts at every flush that the mirror matches
-  Python and that replayed results equal the native ones.
+  Python and that replayed results do not contradict the native ones.
 - **Crossing accounting** (Qwen harness, not checked in): a `sys.monitoring` hook
   attributes every Python SymNode, sympy and glue call during the compile to an allow-listed bucket
   or to NOT ALLOWED, and the harness fails unless NOT ALLOWED is empty.
 
 ## 10. Results (measured with C++ FakeTensor)
+
+These numbers were measured with the earlier hand-written sympy port in place of SymEngine.
 
 Qwen3-8B dynamic prefill, crossings during the compiled call:
 

@@ -2,9 +2,11 @@
 
 #include <ATen/PythonTorchFunctionTLS.h>
 
+#include <torch/csrc/symbolic/Functions.h>
 #include <torch/csrc/symbolic/PyFallback.h>
 
 #include <algorithm>
+#include <array>
 #include <limits>
 
 namespace torch::symbolic {
@@ -29,54 +31,6 @@ std::vector<c10::SymNode> to_python(c10::ArrayRef<c10::SymNode> nodes) {
   return out;
 }
 
-bool is_int_oo(const Expr* e) {
-  return e->kind == Kind::IntInfinity || e->kind == Kind::NegativeIntInfinity;
-}
-
-// functions._is_symbols_binary_summation.
-bool is_symbols_binary_summation(const Expr* e) {
-  return e->kind == Kind::Add && e->args.size() == 2 &&
-      e->args[0]->kind == Kind::Symbol && e->args[1]->kind == Kind::Symbol &&
-      e->args[0] != e->args[1];
-}
-
-// The optimized_summation flag of _optimized_add(lhs, rhs, lopt, ropt), whose
-// expression is always Add(lhs, rhs) = out. The args of an optimized summation
-// are distinct symbols sorted by Basic.compare, so _binary_search_insert_arg
-// fails exactly when the arg is already there.
-bool optimized_add_flag(
-    ExprArena& arena,
-    const Expr* lhs,
-    bool lopt,
-    const Expr* rhs,
-    bool ropt,
-    const Expr* out) {
-  lopt = lopt || is_symbols_binary_summation(lhs);
-  ropt = ropt || is_symbols_binary_summation(rhs);
-  auto contains = [](const Expr* sum, const Expr* a) {
-    return std::find(sum->args.begin(), sum->args.end(), a) != sum->args.end();
-  };
-  if (lopt && ropt) {
-    if (arena.compare(lhs->args.back(), rhs->args.front()) < 0 ||
-        arena.compare(lhs->args.front(), rhs->args.back()) > 0) {
-      return true;
-    }
-    if (lhs->args.size() <= 2 && rhs->args.size() <= 2 &&
-        std::none_of(rhs->args.begin(), rhs->args.end(), [&](const Expr* a) {
-          return contains(lhs, a);
-        })) {
-      return true;
-    }
-  }
-  if (lopt && rhs->kind == Kind::Symbol && !contains(lhs, rhs)) {
-    return true;
-  }
-  if (ropt && lhs->kind == Kind::Symbol && !contains(rhs, lhs)) {
-    return true;
-  }
-  return is_symbols_binary_summation(out);
-}
-
 // Python int power; nullopt on a negative exponent (a float) or overflow.
 std::optional<int64_t> int_pow(int64_t base, int64_t exp) {
   if (exp < 0) {
@@ -96,73 +50,84 @@ std::optional<int64_t> int_pow(int64_t base, int64_t exp) {
 }
 
 // bool() of an evaluate_expr result; nullopt for no result.
-std::optional<bool> as_bool(const Expr* e) {
-  if (e == nullptr) {
+std::optional<bool> truth(const MaybeExpr& e) {
+  if (!e) {
     return std::nullopt;
   }
-  switch (e->kind) {
-    case Kind::BooleanTrue:
-      return true;
-    case Kind::BooleanFalse:
-      return false;
-    case Kind::Integer:
-      return e->p != 0;
-    default:
-      return std::nullopt;
+  if (auto b = as_bool(*e)) {
+    return b;
   }
+  if (auto i = as_int64(*e)) {
+    return *i != 0;
+  }
+  return std::nullopt;
 }
 
 // sym_node.sympy_is_contiguous_generic.
-const Expr* contiguous_generic(
-    ExprArena& a,
-    c10::ArrayRef<const Expr*> sizes,
-    c10::ArrayRef<const Expr*> strides,
+Expr contiguous_generic(
+    c10::ArrayRef<Expr> sizes,
+    c10::ArrayRef<Expr> strides,
     c10::ArrayRef<size_t> dim_order) {
   if (dim_order.size() != sizes.size()) {
-    return a.boolean(false);
+    return boolean(false);
   }
-  const Expr* one = a.integer(1);
-  const Expr* r = a.boolean(true);
-  const Expr* z = one;
+  Expr one(1);
+  Expr r = boolean(true);
+  Expr z = one;
   for (size_t d : dim_order) {
-    r = a.logical_and(
+    r = logical_and(
         {r,
-         a.logical_or(
-             {a.rel(Kind::Eq, sizes[d], one),
-              a.rel(Kind::Eq, strides[d], z)})});
-    z = a.mul({z, sizes[d]});
+         logical_or(
+             {rel(Rel::Eq, sizes[d], one), rel(Rel::Eq, strides[d], z)})});
+    z = z * sizes[d];
   }
-  for (const Expr* s : sizes) {
-    r = a.logical_or({r, a.rel(Kind::Eq, s, a.integer(0))});
+  for (const Expr& s : sizes) {
+    r = logical_or({r, rel(Rel::Eq, s, Expr(0))});
   }
   return r;
 }
 
 // sym_node.sympy_is_channels_last_strides_generic.
-const Expr* channels_last_strides_generic(
-    ExprArena& a,
-    c10::ArrayRef<const Expr*> sizes,
-    c10::ArrayRef<const Expr*> strides,
+Expr channels_last_strides_generic(
+    c10::ArrayRef<Expr> sizes,
+    c10::ArrayRef<Expr> strides,
     c10::ArrayRef<size_t> dim_order) {
   if (dim_order.size() != sizes.size()) {
-    return a.boolean(false);
+    return boolean(false);
   }
-  const Expr* zero = a.integer(0);
-  const Expr* m = zero;
-  const Expr* r =
-      a.logical_and({a.boolean(true), a.rel(Kind::Ne, strides[1], zero)});
+  Expr zero(0);
+  Expr m = zero;
+  Expr r = rel(Rel::Ne, strides[1], zero);
   for (size_t d : dim_order) {
-    r = a.logical_and(
-        {r,
-         a.logical_and(
-             {a.rel(Kind::Ne, sizes[d], zero),
-              a.rel(Kind::Ge, strides[d], m)})});
+    r = logical_and(
+        {r, rel(Rel::Ne, sizes[d], zero), rel(Rel::Ge, strides[d], m)});
     if (d == 0) {
-      r = a.logical_and({r, a.rel(Kind::Ne, m, strides[1])});
+      r = logical_and({r, rel(Rel::Ne, m, strides[1])});
     }
-    m = a.mul({strides[d], a.function(Kind::Max, {sizes[d], a.integer(1)})});
+    m = strides[d] * sym_max({sizes[d], Expr(1)});
   }
   return r;
+}
+
+// e if it is not decided by the facts of its symbols, as sympy evaluates
+// relationals with the assumptions of the symbols, else its value.
+Expr fold(const Expr& e, const SymbolTable& symbols) {
+  try {
+    ValueRanges r = bound_sympy(e, {}, symbols);
+    return r.is_singleton() ? r.lower : e;
+  } catch (const NativeUnsupported&) {
+    return e;
+  }
+}
+
+// f(), or null where it needs what the native side lacks.
+template <typename F>
+c10::SymNode native_or_null(F f) {
+  try {
+    return f();
+  } catch (const NativeUnsupported&) {
+    return {};
+  }
 }
 
 // sym_min/sym_max/sym_not reach a TorchFunctionMode through has_torch_function.
@@ -175,17 +140,15 @@ bool torch_function_pending() {
 
 NativeSymNodeImpl::NativeSymNodeImpl(
     c10::intrusive_ptr<NativeShapeEnv> env,
-    const Expr* expr,
+    Expr expr,
     PyType pytype,
     Hint hint,
-    Hint constant,
-    bool optimized_summation)
+    Hint constant)
     : env_(std::move(env)),
-      expr_(expr),
+      expr_(std::move(expr)),
       pytype_(pytype),
       hint_(hint),
-      constant_(constant),
-      optimized_summation_(optimized_summation) {
+      constant_(constant) {
   if (env_->live_nodes().fetch_add(1) == 0) {
     live_nodes_changed(*env_);
   }
@@ -201,17 +164,11 @@ std::optional<int64_t> NativeSymNodeImpl::maybe_as_int() {
   {
     auto lock = lock_env(*env_);
     if (env_->replacements_empty()) {
-      switch (expr_->kind) {
-        case Kind::Integer:
-          return expr_->p;
-        case Kind::Rational:
-          return expr_->p / expr_->q;
-        case Kind::IntInfinity:
-        case Kind::NegativeIntInfinity:
-          break;
-        default:
-          // Not a number: a native expression without free symbols is one.
-          return std::nullopt;
+      if (auto i = as_int64(expr_)) {
+        return i;
+      }
+      if (!is_number(expr_)) {
+        return std::nullopt;
       }
     }
   }
@@ -219,11 +176,13 @@ std::optional<int64_t> NativeSymNodeImpl::maybe_as_int() {
 }
 
 std::string NativeSymNodeImpl::str() {
+  bool replacements_empty = false;
   {
     auto lock = lock_env(*env_);
-    if (env_->replacements_empty()) {
-      return env_->arena().str(expr_);
-    }
+    replacements_empty = env_->replacements_empty();
+  }
+  if (replacements_empty) {
+    return sympy_str(*this);
   }
   return materialize(*this)->str();
 }
@@ -231,7 +190,7 @@ std::string NativeSymNodeImpl::str() {
 c10::SymNode NativeSymNodeImpl::wrap_int(int64_t num) {
   auto lock = lock_env(*env_);
   return c10::make_intrusive<NativeSymNodeImpl>(
-      env_, env_->arena().integer(num), PyType::Int, num, num);
+      env_, Expr(num), PyType::Int, num, num);
 }
 
 c10::SymNode NativeSymNodeImpl::wrap_float(double num) {
@@ -240,14 +199,14 @@ c10::SymNode NativeSymNodeImpl::wrap_float(double num) {
 
 c10::SymNode NativeSymNodeImpl::wrap_bool(bool num) {
   return c10::make_intrusive<NativeSymNodeImpl>(
-      env_, env_->arena().boolean(num), PyType::Bool, num, num);
+      env_, boolean(num), PyType::Bool, num, num);
 }
 
 c10::SymNode NativeSymNodeImpl::binary(
     Op op,
     BinaryFn fallback,
     const c10::SymNode& other) {
-  static constexpr const char* proxy_methods[] = {
+  static constexpr std::array proxy_methods = {
       "_add",
       "_sub",
       "_mul",
@@ -264,7 +223,7 @@ c10::SymNode NativeSymNodeImpl::binary(
       "_ge",
       "_and_",
       "_or_"};
-  static constexpr const char* op_names[] = {
+  static constexpr std::array op_names = {
       "add",
       "sub",
       "mul",
@@ -289,8 +248,8 @@ c10::SymNode NativeSymNodeImpl::binary(
     // The Python impl first computes op(self.hint, other.hint), which raises
     // on a zero divisor and may not terminate for pow.
     bool python_hint = op == Op::PowByNatural ||
-        ((op == Op::FloorDiv || op == Op::Mod) && has_hint() &&
-         o != nullptr && o->has_hint() &&
+        ((op == Op::FloorDiv || op == Op::Mod) && has_hint() && o != nullptr &&
+         o->has_hint() &&
          std::visit(
              [](auto v) {
                if constexpr (std::is_same_v<decltype(v), std::monostate>) {
@@ -310,11 +269,8 @@ c10::SymNode NativeSymNodeImpl::binary(
   }
   if (o != nullptr && o->env_ == env_) {
     auto lock = lock_env(*env_);
-    try {
-      if (auto r = try_binary(op, *o)) {
-        return r;
-      }
-    } catch (const NativeUnsupported&) {
+    if (auto r = native_or_null([&] { return try_binary(op, *o); })) {
+      return r;
     }
   }
   return (materialize(*this).get()->*fallback)(to_python(other));
@@ -362,11 +318,7 @@ c10::SymNode NativeSymNodeImpl::proxy_compute(Op op, NativeSymNodeImpl& other) {
     }
   }
   auto lock = lock_env(*env_);
-  try {
-    return lhs->try_binary(op, *rhs);
-  } catch (const NativeUnsupported&) {
-    return {};
-  }
+  return native_or_null([&] { return lhs->try_binary(op, *rhs); });
 }
 
 c10::SymNode NativeSymNodeImpl::try_binary(
@@ -469,30 +421,26 @@ c10::SymNode NativeSymNodeImpl::try_binary(
     }
   }
 
-  ExprArena& arena = env_->arena();
-  const Expr* a = expr_;
-  const Expr* b = other.expr_;
+  const Expr& a = expr_;
+  const Expr& b = other.expr_;
   // IntInfinity overloads the Python operators.
   if ((op == Op::Add || op == Op::Sub || op == Op::Mul) &&
       (is_int_oo(a) || is_int_oo(b))) {
     return {};
   }
-  const Expr* out = nullptr;
-  bool optimized_summation = false;
+  Expr out;
   switch (op) {
     case Op::Add:
-      out = arena.add({a, b});
-      optimized_summation = optimized_add_flag(
-          arena, a, optimized_summation_, b, other.optimized_summation_, out);
+      out = a + b;
       break;
     case Op::Sub:
-      out = arena.sub(a, b);
+      out = a - b;
       break;
     case Op::Mul:
-      out = arena.mul({a, b});
+      out = a * b;
       break;
     case Op::FloorDiv:
-      out = arena.function(Kind::FloorDiv, {a, b});
+      out = function(Fn::FloorDiv, {a, b});
       break;
     case Op::Mod: {
       // bound_lower_nonnegative throws once the env is not pristine, so then
@@ -503,65 +451,72 @@ c10::SymNode NativeSymNodeImpl::try_binary(
         out = it->second;
         break;
       }
-      auto nonnegative = [&](const Expr* e) {
-        return arena.ask(e, Fact::nonnegative) == Tri::True ||
+      auto nonnegative = [&](const Expr& e) {
+        return env_->symbols().nonnegative(e) ||
             env_->bound_lower_nonnegative(e);
       };
       bool mod = nonnegative(a) && nonnegative(b);
-      out = arena.function(mod ? Kind::Mod : Kind::PythonMod, {a, b});
+      out = function(mod ? Fn::Mod : Fn::PythonMod, {a, b});
       if (env_->pristine()) {
         memo.emplace(std::make_pair(a, b), out);
       }
       break;
     }
     case Op::PowByNatural:
-      out = arena.function(Kind::PowByNatural, {a, b});
+      out = function(Fn::PowByNatural, {a, b});
       break;
     case Op::Min:
-      out = arena.function(Kind::Min, {a, b});
+    case Op::Max: {
+      // As sympy's Max and Min use the assumptions of the symbols.
+      auto le = as_bool(fold(rel(Rel::Le, a, b), env_->symbols()));
+      if (!le && as_bool(fold(rel(Rel::Le, b, a), env_->symbols())) == true) {
+        le = false;
+      }
+      if (le) {
+        out = (op == Op::Min) == *le ? a : b;
+      } else {
+        out = op == Op::Min ? symbolic::sym_min({a, b})
+                            : symbolic::sym_max({a, b});
+      }
       break;
-    case Op::Max:
-      out = arena.function(Kind::Max, {a, b});
-      break;
+    }
     case Op::Eq:
     case Op::Ne:
     case Op::Gt:
     case Op::Lt:
     case Op::Le:
     case Op::Ge: {
-      auto unbacked = [&](const Expr* e) {
-        if (e->kind != Kind::Symbol) {
+      auto unbacked = [&](const Expr& e) {
+        if (!is_symbol(e)) {
           return false;
         }
-        const std::string& name = arena.symbol_info(e).name;
+        const std::string& name = symbol_name(e);
         return !name.empty() && (name[0] == 'u' || name[0] == 'U');
       };
       bool evaluate =
-          !((unbacked(a) && b->is_number()) || (unbacked(b) && a->is_number()));
-      Kind kind = op == Op::Eq ? Kind::Eq
-          : op == Op::Ne       ? Kind::Ne
-          : op == Op::Gt       ? Kind::Gt
-          : op == Op::Lt       ? Kind::Lt
-          : op == Op::Le       ? Kind::Le
-                               : Kind::Ge;
-      out = arena.rel(kind, a, b, evaluate);
+          !((unbacked(a) && is_number(b)) || (unbacked(b) && is_number(a)));
+      Rel kind = op == Op::Eq ? Rel::Eq
+          : op == Op::Ne      ? Rel::Ne
+          : op == Op::Gt      ? Rel::Gt
+          : op == Op::Lt      ? Rel::Lt
+          : op == Op::Le      ? Rel::Le
+                              : Rel::Ge;
+      out = rel(kind, a, b, evaluate);
+      if (evaluate) {
+        out = fold(out, env_->symbols());
+      }
       break;
     }
     case Op::And:
-      out = arena.logical_and({a, b});
+      out = logical_and({a, b});
       break;
     case Op::Or:
-      out = arena.logical_or({a, b});
+      out = logical_or({a, b});
       break;
   }
   bool int_result = op <= Op::Max;
   return c10::make_intrusive<NativeSymNodeImpl>(
-      env_,
-      out,
-      int_result ? PyType::Int : PyType::Bool,
-      hint,
-      Hint{},
-      optimized_summation);
+      env_, out, int_result ? PyType::Int : PyType::Bool, hint);
 }
 
 c10::SymNode NativeSymNodeImpl::unary(bool is_not, UnaryFn fallback) {
@@ -572,11 +527,7 @@ c10::SymNode NativeSymNodeImpl::unary(bool is_not, UnaryFn fallback) {
         return {};
       }
       auto lock = lock_env(*env_);
-      try {
-        return try_unary(is_not);
-      } catch (const NativeUnsupported&) {
-        return {};
-      }
+      return native_or_null([&] { return try_unary(is_not); });
     };
     return is_not
         ? proxy_dispatch("_sym_not", "sym_not", {clone()}, false, compute)
@@ -584,11 +535,8 @@ c10::SymNode NativeSymNodeImpl::unary(bool is_not, UnaryFn fallback) {
   }
   {
     auto lock = lock_env(*env_);
-    try {
-      if (auto r = try_unary(is_not)) {
-        return r;
-      }
-    } catch (const NativeUnsupported&) {
+    if (auto r = native_or_null([&] { return try_unary(is_not); })) {
+      return r;
     }
   }
   return (materialize(*this).get()->*fallback)();
@@ -599,14 +547,13 @@ c10::SymNode NativeSymNodeImpl::try_unary(bool is_not) {
   if (!env_->replacements_empty() || pytype_ != operand) {
     return {};
   }
-  ExprArena& arena = env_->arena();
   Hint hint;
-  const Expr* out = nullptr;
+  Expr out;
   if (is_not) {
     if (has_hint()) {
       hint = !std::get<bool>(hint_);
     }
-    out = arena.logical_not(expr_);
+    out = logical_not(expr_);
   } else {
     if (has_hint()) {
       int64_t x = std::get<int64_t>(hint_);
@@ -618,7 +565,7 @@ c10::SymNode NativeSymNodeImpl::try_unary(bool is_not) {
     if (is_int_oo(expr_)) {
       return {};
     }
-    out = arena.neg(expr_);
+    out = -expr_;
   }
   return c10::make_intrusive<NativeSymNodeImpl>(env_, out, operand, hint);
 }
@@ -693,7 +640,7 @@ c10::SymNode NativeSymNodeImpl::sizes_strides(
     SizesStrides fn,
     c10::ArrayRef<c10::SymNode> sizes,
     c10::ArrayRef<c10::SymNode> strides) {
-  static constexpr const char* py_methods[] = {
+  static constexpr std::array py_methods = {
       "_is_contiguous",
       "_is_channels_last_contiguous_2d",
       "_is_channels_last_contiguous_3d",
@@ -709,11 +656,9 @@ c10::SymNode NativeSymNodeImpl::sizes_strides(
   }
   {
     auto lock = lock_env(*env_);
-    try {
-      if (auto r = try_sizes_strides(fn, sizes, strides)) {
-        return r;
-      }
-    } catch (const NativeUnsupported&) {
+    if (auto r = native_or_null(
+            [&] { return try_sizes_strides(fn, sizes, strides); })) {
+      return r;
     }
   }
   return python_impl(
@@ -728,9 +673,8 @@ c10::SymNode NativeSymNodeImpl::try_sizes_strides(
     return {};
   }
   // A missing hint makes Python compute one, which can populate caches.
-  std::vector<const Expr*> exprs;
-  std::vector<const Expr*> hints;
-  ExprArena& arena = env_->arena();
+  std::vector<Expr> exprs;
+  std::vector<Expr> hints;
   for (auto nodes : {sizes, strides}) {
     for (const auto& n : nodes) {
       auto* o = as_native(n);
@@ -739,11 +683,11 @@ c10::SymNode NativeSymNodeImpl::try_sizes_strides(
         return {};
       }
       exprs.push_back(o->expr_);
-      hints.push_back(arena.integer(std::get<int64_t>(o->hint_)));
+      hints.emplace_back(std::get<int64_t>(o->hint_));
     }
   }
   const size_t dim = sizes.size();
-  auto build = [&](c10::ArrayRef<const Expr*> args) -> const Expr* {
+  auto build = [&](c10::ArrayRef<Expr> args) -> Expr {
     auto size_args = args.slice(0, dim);
     auto stride_args = args.slice(dim);
     switch (fn) {
@@ -752,39 +696,39 @@ c10::SymNode NativeSymNodeImpl::try_sizes_strides(
         for (size_t i = 0; i < dim; ++i) {
           order[i] = dim - 1 - i;
         }
-        return contiguous_generic(arena, size_args, stride_args, order);
+        return contiguous_generic(size_args, stride_args, order);
       }
       case SizesStrides::ChannelsLastContiguous2d:
-        return contiguous_generic(arena, size_args, stride_args, {1, 3, 2, 0});
+        return contiguous_generic(size_args, stride_args, {1, 3, 2, 0});
       case SizesStrides::ChannelsLastContiguous3d:
-        return contiguous_generic(
-            arena, size_args, stride_args, {1, 4, 3, 2, 0});
+        return contiguous_generic(size_args, stride_args, {1, 4, 3, 2, 0});
       case SizesStrides::ChannelsLastStrides2d:
         return channels_last_strides_generic(
-            arena, size_args, stride_args, {1, 3, 2, 0});
+            size_args, stride_args, {1, 3, 2, 0});
       case SizesStrides::ChannelsLastStrides3d:
         return channels_last_strides_generic(
-            arena, size_args, stride_args, {1, 4, 3, 2, 0});
+            size_args, stride_args, {1, 4, 3, 2, 0});
       case SizesStrides::Indicator:
         break;
     }
-    return arena.function(Kind::IsNonOverlappingAndDenseIndicator, args);
+    return function(Fn::IsNonOverlappingAndDenseIndicator, args);
   };
   if (strides.size() != dim) {
     throw NativeUnsupported("sizes and strides differ in length");
   }
-  const Expr* out = build(exprs);
+  Expr out = build(exprs);
   // The hint is the same method applied to the int hints: bool(func(...)),
   // or eval_is_non_overlapping_and_dense for the indicator.
-  const Expr* h = build(hints);
+  Expr h = build(hints);
   if (fn == SizesStrides::Indicator) {
-    if (h->kind != Kind::Integer) {
+    auto i = as_int64(h);
+    if (!i) {
       throw NativeUnsupported("indicator hint did not fold");
     }
-    return c10::make_intrusive<NativeSymNodeImpl>(env_, out, PyType::Int, h->p);
+    return c10::make_intrusive<NativeSymNodeImpl>(env_, out, PyType::Int, *i);
   }
   auto b = as_bool(h);
-  if (!b || h->kind == Kind::Integer) {
+  if (!b) {
     throw NativeUnsupported("sizes/strides hint did not fold");
   }
   return c10::make_intrusive<NativeSymNodeImpl>(env_, out, PyType::Bool, *b);
@@ -820,11 +764,8 @@ c10::SymNode NativeSymNodeImpl::sym_sum(c10::ArrayRef<c10::SymNode> args) {
   }
   {
     auto lock = lock_env(*env_);
-    try {
-      if (auto r = try_sym_sum(args)) {
-        return r;
-      }
-    } catch (const NativeUnsupported&) {
+    if (auto r = native_or_null([&] { return try_sym_sum(args); })) {
+      return r;
     }
   }
   return python_impl("sym_sum", materialize(*this), to_python(args));
@@ -834,7 +775,7 @@ c10::SymNode NativeSymNodeImpl::try_sym_sum(c10::ArrayRef<c10::SymNode> args) {
   if (!env_->replacements_empty()) {
     return {};
   }
-  std::vector<const Expr*> exprs;
+  std::vector<Expr> exprs;
   std::optional<int64_t> total = 0;
   for (const auto& n : args) {
     auto* o = as_native(n);
@@ -858,27 +799,28 @@ c10::SymNode NativeSymNodeImpl::try_sym_sum(c10::ArrayRef<c10::SymNode> args) {
     hint = *total;
   }
   return c10::make_intrusive<NativeSymNodeImpl>(
-      env_, env_->arena().add(exprs), PyType::Int, hint);
+      env_, symbolic::add(exprs), PyType::Int, hint);
 }
 
-const Expr* NativeSymNodeImpl::evaluate(std::optional<bool> fallback_value) {
+MaybeExpr NativeSymNodeImpl::evaluate(std::optional<bool> fallback_value) {
   if (!native_config_is_default()) {
-    return nullptr;
+    return std::nullopt;
   }
   auto lock = lock_env(*env_);
-  return env_->evaluate_expr(expr_, hint_, fallback_value).value_or(nullptr);
+  return env_->evaluate_expr(expr_, hint_, fallback_value)
+      .value_or(std::nullopt);
 }
 
 int64_t NativeSymNodeImpl::guard_int(const char* file, int64_t line) {
-  const Expr* r = evaluate(std::nullopt);
-  if (r != nullptr && r->kind == Kind::Integer) {
-    return r->p;
+  MaybeExpr r = evaluate(std::nullopt);
+  if (auto i = r ? as_int64(*r) : std::nullopt) {
+    return *i;
   }
   return materialize(*this)->guard_int(file, line);
 }
 
 bool NativeSymNodeImpl::guard_bool(const char* file, int64_t line) {
-  if (auto r = as_bool(evaluate(std::nullopt))) {
+  if (auto r = truth(evaluate(std::nullopt))) {
     return *r;
   }
   return materialize(*this)->guard_bool(file, line);
@@ -886,7 +828,7 @@ bool NativeSymNodeImpl::guard_bool(const char* file, int64_t line) {
 
 bool NativeSymNodeImpl::guard_or_false(const char* file, int64_t line) {
   if (pytype_ == PyType::Bool) {
-    if (auto r = as_bool(evaluate(false))) {
+    if (auto r = truth(evaluate(false))) {
       return *r;
     }
   }
@@ -895,7 +837,7 @@ bool NativeSymNodeImpl::guard_or_false(const char* file, int64_t line) {
 
 bool NativeSymNodeImpl::guard_or_true(const char* file, int64_t line) {
   if (pytype_ == PyType::Bool) {
-    if (auto r = as_bool(evaluate(true))) {
+    if (auto r = truth(evaluate(true))) {
       return *r;
     }
   }
@@ -908,16 +850,13 @@ bool NativeSymNodeImpl::statically_known_true(const char* file, int64_t line) {
     if (hint_ == Hint(false)) {
       return false;
     }
-    std::optional<const Expr*> r;
+    std::optional<MaybeExpr> r;
     {
       auto lock = lock_env(*env_);
       r = env_->static_eval(expr_);
     }
-    if (r && *r == nullptr) {
-      return false;
-    }
-    if (auto b = r ? as_bool(*r) : std::nullopt) {
-      return *b;
+    if (r) {
+      return truth(*r).value_or(false);
     }
   }
   return materialize(*this)->statically_known_true(file, line);
@@ -927,7 +866,7 @@ bool NativeSymNodeImpl::expect_true(const char* file, int64_t line) {
   // A native env has prefer_deferred_runtime_asserts_over_guards unset, and
   // evaluate() answers only for mirrored (backed) symbols.
   if (has_hint()) {
-    if (auto r = as_bool(evaluate(std::nullopt))) {
+    if (auto r = truth(evaluate(std::nullopt))) {
       return *r;
     }
   }

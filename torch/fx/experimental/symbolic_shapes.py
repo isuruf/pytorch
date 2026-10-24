@@ -4164,7 +4164,14 @@ def _flush_native_queries() -> None:
                 result = env._maybe_evaluate_static(expr)
             except Exception:
                 result = None
-        if _NATIVE_SYMNODE_CHECK and result != native_result:
+        # The native evaluator may prove more or less than Python, but never
+        # something different.
+        if (
+            _NATIVE_SYMNODE_CHECK
+            and result is not None
+            and native_result is not None
+            and result != native_result
+        ):
             raise AssertionError(
                 f"native answered {native_result} for {query}, Python {result}"
             )

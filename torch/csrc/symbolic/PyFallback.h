@@ -17,6 +17,9 @@ class NativeSymNodeImpl;
 // identity of its operands.
 c10::SymNode materialize(const NativeSymNodeImpl& node);
 
+// str() of the sympy expression of `node`. Takes the GIL.
+std::string sympy_str(const NativeSymNodeImpl& node);
+
 // Called when env.live_nodes() changes between 0 and nonzero; holds or
 // releases the Python ShapeEnv to match. Takes the GIL.
 void live_nodes_changed(NativeShapeEnv& env);

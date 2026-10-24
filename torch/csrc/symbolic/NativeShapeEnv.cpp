@@ -1,40 +1,35 @@
 #include <torch/csrc/symbolic/NativeShapeEnv.h>
 
+#include <torch/csrc/symbolic/Functions.h>
+
 #include <c10/util/hash.h>
+
+#include <symengine/add.h>
+#include <symengine/logic.h>
 
 #include <algorithm>
 #include <atomic>
-#include <string>
 
 namespace torch::symbolic {
 
 namespace {
 
-bool is_int_oo(const Expr* e) {
-  return e->kind == Kind::IntInfinity || e->kind == Kind::NegativeIntInfinity;
-}
-
-// expr.atoms(*kinds).
-c10::SmallVector<const Expr*, 4> atoms(
-    const Expr* e,
-    std::initializer_list<Kind> kinds) {
-  c10::SmallVector<const Expr*, 4> out;
-  c10::SmallVector<const Expr*, 16> stack{e};
+// The Max and Min atoms of e.
+std::vector<Expr> min_max_atoms(const Expr& e) {
+  std::vector<Expr> out;
+  std::vector<Expr> stack{e};
   while (!stack.empty()) {
-    const Expr* t = stack.pop_back_val();
-    if (std::find(kinds.begin(), kinds.end(), t->kind) != kinds.end() &&
+    Expr t = stack.back();
+    stack.pop_back();
+    if ((is_max(t) || is_min(t)) &&
         std::find(out.begin(), out.end(), t) == out.end()) {
       out.push_back(t);
     }
-    stack.append(t->args.begin(), t->args.end());
+    for (Expr& a : args(t)) {
+      stack.push_back(std::move(a));
+    }
   }
   return out;
-}
-
-bool is_nonnegative_value(const Expr* value) {
-  return value->kind == Kind::IntInfinity || value->kind == Kind::Infinity ||
-      (value->kind != Kind::NegativeIntInfinity &&
-       value->kind != Kind::NegativeInfinity && value->p >= 0);
 }
 
 std::atomic<uint64_t> query_seq{0};
@@ -53,7 +48,7 @@ NativeShapeEnv::~NativeShapeEnv() {
 
 size_t NativeShapeEnv::QueryHash::operator()(const NativeQuery& q) const {
   return c10::get_hash(
-      q.expr,
+      ExprHash()(q.expr),
       q.evaluate,
       q.hint.index(),
       std::visit(
@@ -70,7 +65,7 @@ size_t NativeShapeEnv::QueryHash::operator()(const NativeQuery& q) const {
       q.suppress_guards);
 }
 
-void NativeShapeEnv::log_query(const NativeQuery& q, const Expr* result) {
+void NativeShapeEnv::log_query(const NativeQuery& q, const MaybeExpr& result) {
   auto [it, inserted] = queries_.try_emplace(q);
   if (inserted) {
     ++pending_queries;
@@ -97,12 +92,10 @@ bool NativeShapeEnv::queries_pending() {
 }
 
 void NativeShapeEnv::add_symbol(
-    const Expr* sym,
+    const Expr& sym,
     std::optional<int64_t> hint,
-    const ValueRanges& range,
-    bool size_like) {
-  if (sym->kind != Kind::Symbol || !range.is_int() ||
-      arena_->symbol_info(sym).dummy_index != 0) {
+    const ValueRanges& range) {
+  if (!is_symbol(sym) || !range.is_int()) {
     throw NativeUnsupported("add_symbol needs an integer symbol");
   }
   TORCH_CHECK(var_to_range_.count(sym) == 0, "symbol already mirrored");
@@ -110,12 +103,9 @@ void NativeShapeEnv::add_symbol(
   if (hint) {
     backed_var_to_val_[sym] = *hint;
   }
-  if (size_like) {
-    size_like_.insert(sym);
-  }
 }
 
-void NativeShapeEnv::update_range(const Expr* sym, const ValueRanges& range) {
+void NativeShapeEnv::update_range(const Expr& sym, const ValueRanges& range) {
   pristine_ = false;
   if (!range.is_int()) {
     var_to_range_.erase(sym);
@@ -124,230 +114,75 @@ void NativeShapeEnv::update_range(const Expr* sym, const ValueRanges& range) {
   var_to_range_.insert_or_assign(sym, range);
 }
 
-std::optional<std::tuple<std::optional<int64_t>, ValueRanges, bool>>
-NativeShapeEnv::mirrored(const Expr* sym) const {
+std::optional<std::pair<std::optional<int64_t>, ValueRanges>> NativeShapeEnv::
+    mirrored(const Expr& sym) const {
   auto it = var_to_range_.find(sym);
   if (it == var_to_range_.end()) {
     return std::nullopt;
   }
   auto hint = backed_var_to_val_.find(sym);
-  return std::make_tuple(
+  return std::make_pair(
       hint == backed_var_to_val_.end() ? std::nullopt
                                        : std::optional<int64_t>(hint->second),
-      it->second,
-      size_like_.count(sym) != 0);
+      it->second);
 }
 
-bool NativeShapeEnv::all_symbols_mirrored(const Expr* e) const {
-  for (const Expr* s : arena_->free_symbols(e)) {
-    if (var_to_range_.count(s) == 0) {
-      return false;
-    }
-  }
-  return true;
+bool NativeShapeEnv::all_symbols_mirrored(const Expr& e) const {
+  auto fs = free_symbols(e);
+  return std::all_of(fs.begin(), fs.end(), [&](const Expr& s) {
+    return var_to_range_.count(s) != 0;
+  });
 }
 
-std::optional<const Expr*> NativeShapeEnv::lower_bound(const Expr* e) {
-  ExprArena& a = *arena_;
-  auto term_bound = [&](const Expr* term) -> std::optional<const Expr*> {
-    if (term->is_number()) {
-      return term;
-    }
-    auto [coeff, base] = a.as_coeff_Mul(term);
-    if (base->kind != Kind::Symbol) {
-      return std::nullopt;
-    }
-    auto it = var_to_range_.find(base);
-    if (it != var_to_range_.end()) {
-      bool nonneg = is_nonnegative_value(coeff);
-      const Expr* bound = nonneg ? it->second.lower : it->second.upper;
-      if (is_int_oo(bound)) {
-        bool positive = (bound->kind == Kind::IntInfinity) == nonneg;
-        return positive ? a.int_oo() : a.neg_int_oo();
-      }
-      return a.mul({coeff, bound});
-    }
-    if (a.ask(base, Fact::nonnegative) == Tri::True &&
-        is_nonnegative_value(coeff)) {
-      return a.integer(0);
-    }
-    return std::nullopt;
-  };
-  if (e->kind != Kind::Add) {
-    return term_bound(e);
-  }
-  const Expr* result = a.integer(0);
-  for (const Expr* term : e->args) {
-    auto b = term_bound(term);
-    if (!b) {
-      return std::nullopt;
-    }
-    if (is_int_oo(*b) || is_int_oo(result)) {
-      if (is_int_oo(*b) && is_int_oo(result) && *b != result) {
-        throw NativeUnsupported("int_oo + -int_oo");
-      }
-      result = is_int_oo(*b) ? *b : result;
-    } else {
-      result = a.add({result, *b});
-    }
-  }
-  return result;
-}
-
-bool NativeShapeEnv::is_nonneg_term(const Expr* term) {
-  // is_nonnegative_term in ShapeEnv.simplify.
-  if (term->is_number()) {
-    return is_nonnegative_value(term);
-  }
-  if (arena_->ask(term, Fact::nonnegative) == Tri::True) {
+bool NativeShapeEnv::definitely_le(const Expr& a, const Expr& b) {
+  if (a == b) {
     return true;
   }
-  if (term->kind == Kind::Symbol) {
-    auto it = var_to_range_.find(term);
-    return it != var_to_range_.end() && is_nonnegative_value(it->second.lower);
+  try {
+    ValueRanges d = bound_sympy(expand(b - a), var_to_range_, *symbols_);
+    return compare_numbers(d.lower, Expr(0)) >= 0;
+  } catch (const NativeUnsupported&) {
+    return false;
   }
-  return false;
 }
 
-bool NativeShapeEnv::definitely_le(
-    const Expr* a,
-    const Expr* b,
-    bool use_static_fallback,
-    LeCache& le_cache) {
-  auto key = std::make_tuple(a, b, use_static_fallback);
-  auto it = le_cache.find(key);
-  if (it != le_cache.end()) {
-    return it->second;
-  }
-  auto answer = [&](bool r) {
-    le_cache.emplace(key, r);
-    return r;
-  };
-  ExprArena& ar = *arena_;
-  if (a == b) {
-    return answer(true);
-  }
-  const Expr* diff = ar.sub(b, a);
-  auto diff_lower = lower_bound(diff);
-  if (diff_lower && is_nonnegative_value(*diff_lower)) {
-    return answer(true);
-  }
-  bool nonneg_sum = diff->kind == Kind::Add
-      ? std::all_of(
-            diff->args.begin(),
-            diff->args.end(),
-            [&](const Expr* t) { return is_nonneg_term(t); })
-      : is_nonneg_term(diff);
-  if (nonneg_sum) {
-    return answer(true);
-  }
-  // Every free symbol has a mirrored range, so the comparison ranges are the
-  // mirror restricted to diff's symbols, and none are looked up in the
-  // TracingContext.
-  if (!ar.free_symbols(diff).empty()) {
-    ValueRanges r = bound_sympy(ar, ar.safe_expand(diff), var_to_range_);
-    if (is_nonnegative_value(r.lower)) {
-      return answer(true);
-    }
-  }
-  if (use_static_fallback) {
-    const Expr* comparison = ar.rel(Kind::Le, a, b);
-    if (comparison->kind == Kind::BooleanTrue) {
-      return answer(true);
-    }
-    if (comparison->kind == Kind::BooleanFalse) {
-      return answer(false);
-    }
-    return answer(maybe_evaluate_static(comparison) == ar.boolean(true));
-  }
-  return answer(false);
-}
-
-const Expr* NativeShapeEnv::simplify(const Expr* e) {
-  if (e->has_float) {
-    throw NativeUnsupported("simplify of a Float");
-  }
-  if (!pristine_ || !all_symbols_mirrored(e)) {
+Expr NativeShapeEnv::simplify(const Expr& e_) {
+  if (!pristine_ || !all_symbols_mirrored(e_)) {
     throw NativeUnsupported("simplify needs a pristine, mirrored env");
   }
-  ExprArena& a = *arena_;
   // replace() is the identity while there are no replacements.
-  e = a.safe_expand(e);
-
-  LeCache le_cache;
-  c10::SmallVector<std::pair<const Expr*, const Expr*>, 4> min_max_reps;
-  for (const Expr* atom : atoms(e, {Kind::Min, Kind::Max})) {
-    const auto& args = atom->args;
-    if (args.size() < 2) {
-      continue;
-    }
-    bool is_min = atom->kind == Kind::Min;
-    bool legacy_fallback = !is_min && args.size() == 2;
-    auto small = [&](const Expr* x) {
-      return legacy_fallback && (x == a.integer(0) || x == a.integer(1));
-    };
-    std::vector<bool> keep(args.size(), true);
-    for (size_t i = 0; i < args.size(); ++i) {
-      if (!keep[i]) {
-        continue;
-      }
-      for (size_t j = i + 1; j < args.size(); ++j) {
-        if (!keep[j]) {
+  Expr e = expand(e_);
+  // Drop the Max/Min args that another arg dominates.
+  std::vector<std::pair<Expr, Expr>> reps;
+  for (const Expr& atom : min_max_atoms(e)) {
+    bool max = is_max(atom);
+    auto a = args(atom);
+    std::vector<bool> keep(a.size(), true);
+    for (size_t i = 0; i < a.size(); ++i) {
+      for (size_t j = 0; j < a.size() && keep[i]; ++j) {
+        if (i == j || !keep[j]) {
           continue;
         }
-        if (definitely_le(args[i], args[j], small(args[i]), le_cache)) {
-          if (is_min) {
-            keep[j] = false;
-          } else {
-            keep[i] = false;
-            break;
-          }
-        } else if (definitely_le(args[j], args[i], small(args[j]), le_cache)) {
-          if (is_min) {
-            keep[i] = false;
-            break;
-          } else {
-            keep[j] = false;
-          }
+        // a[i] is redundant when a[j] dominates it.
+        if (max ? definitely_le(a[i], a[j]) : definitely_le(a[j], a[i])) {
+          keep[i] = false;
         }
       }
     }
-    c10::SmallVector<const Expr*, 4> new_args;
-    for (size_t i = 0; i < args.size(); ++i) {
+    std::vector<Expr> kept;
+    for (size_t i = 0; i < a.size(); ++i) {
       if (keep[i]) {
-        new_args.push_back(args[i]);
+        kept.push_back(a[i]);
       }
     }
-    if (new_args.size() != args.size()) {
-      min_max_reps.emplace_back(
-          atom, a.minmax(atom->kind, new_args, /*evaluate=*/false));
+    if (kept.size() != a.size()) {
+      reps.emplace_back(atom, max ? sym_max(kept) : sym_min(kept));
     }
   }
-  if (!min_max_reps.empty()) {
-    e = a.xreplace(e, min_max_reps);
-  }
-
-  c10::SmallVector<std::pair<const Expr*, const Expr*>, 4> trunc_reps;
-  for (const Expr* atom : atoms(e, {Kind::TruncToInt})) {
-    const Expr* arg = atom->args[0];
-    if (arg->kind == Kind::IntTrueDiv) {
-      const Expr* base = arg->args[0];
-      const Expr* divisor = arg->args[1];
-      bool exact = a.function(Kind::Mod, {base, divisor}) == a.integer(0);
-      trunc_reps.emplace_back(
-          atom,
-          a.function(exact ? Kind::CleanDiv : Kind::FloorDiv, {base, divisor}));
-    }
-  }
-  if (!trunc_reps.empty()) {
-    e = a.xreplace(e, trunc_reps);
-  }
-  // The two FloorDiv passes only rewrite FloorDivs whose Mod is in divisible,
-  // which is empty.
-  return e;
+  return reps.empty() ? e : xreplace(e, reps);
 }
 
-const Expr* NativeShapeEnv::maybe_evaluate_static(const Expr* e) {
+MaybeExpr NativeShapeEnv::maybe_evaluate_static(const Expr& e) {
   // Answers need a pristine env (simplify throws otherwise), whose mirrored
   // ranges never change, so they depend only on e.
   if (pristine_) {
@@ -355,107 +190,63 @@ const Expr* NativeShapeEnv::maybe_evaluate_static(const Expr* e) {
       return it->second;
     }
   }
-  const Expr* r = maybe_evaluate_static_uncached(e);
+  MaybeExpr r = maybe_evaluate_static_uncached(e);
   static_memo_.emplace(e, r);
   return r;
 }
 
-const Expr* NativeShapeEnv::maybe_evaluate_static_uncached(const Expr* e) {
-  ExprArena& a = *arena_;
-  e = a.canonicalize_bool_expr(simplify(e));
-  // Substituting the (empty) axioms is the identity.
-  auto fs = a.free_symbols(e);
-  if (fs.empty() && (e->is_number() || e->is_boolean())) {
+MaybeExpr NativeShapeEnv::maybe_evaluate_static_uncached(const Expr& e_) {
+  Expr e = simplify(e_);
+  if (is_number(e) || as_bool(e)) {
     return e;
   }
-  std::sort(fs.begin(), fs.end(), [&](const Expr* x, const Expr* y) {
-    return a.symbol_info(x).name < a.symbol_info(y).name;
-  });
-  for (size_t i = 1; i < fs.size(); ++i) {
-    if (a.symbol_info(fs[i - 1]).name == a.symbol_info(fs[i]).name) {
-      throw NativeUnsupported("sorted(fs, key=str) depends on set order");
-    }
+  ValueRanges out = bound_sympy(e, var_to_range_, *symbols_);
+  if (!out.is_singleton()) {
+    return std::nullopt;
   }
-
-  // _maybe_evaluate_static_worker(e, symbol_info, False, False).
-  c10::SmallVector<std::pair<const Expr*, const Expr*>, 4> new_shape_env;
-  RangeMap new_range_env;
-  for (size_t idx = 0; idx < fs.size(); ++idx) {
-    const Expr* k = fs[idx];
-    auto it = var_to_range_.find(k);
-    if (it == var_to_range_.end()) {
-      throw NativeUnsupported("symbol without a mirrored range");
-    }
-    const ValueRanges& vr = it->second;
-    if (vr.lower == a.neg_int_oo()) {
-      new_range_env.insert_or_assign(k, vr);
-      continue;
-    }
-    if (vr.lower->kind != Kind::Integer) {
-      throw NativeUnsupported("int_oo lower bound");
-    }
-    Facts facts;
-    facts.fill(Tri::Unknown);
-    facts[static_cast<size_t>(Fact::commutative)] = Tri::True;
-    facts[static_cast<size_t>(Fact::positive)] = Tri::True;
-    facts[static_cast<size_t>(Fact::integer)] = Tri::True;
-    const Expr* s =
-        a.symbol("evaluate_static_shape_" + std::to_string(idx), facts);
-    const Expr* offset = a.sub(vr.lower, a.integer(1));
-    new_shape_env.emplace_back(k, a.add({s, offset}));
-    const Expr* upper =
-        is_int_oo(vr.upper) ? vr.upper : a.sub(vr.upper, offset);
-    new_range_env.insert_or_assign(s, ValueRanges(a.integer(1), upper));
-  }
-  const Expr* new_expr =
-      a.canonicalize_bool_expr(a.safe_expand(a.xreplace(e, new_shape_env)));
-  if (new_expr->is_number()) {
-    return new_expr;
-  }
-  ValueRanges out = bound_sympy(a, new_expr, new_range_env);
-  return out.is_singleton() ? out.lower : nullptr;
+  return out.lower;
 }
 
-const Expr* NativeShapeEnv::maybe_fast_eval_comparison(const Expr* e) {
-  const Expr* zero = arena_->integer(0);
-  const Expr* sum = nullptr;
-  if (e->kind == Kind::Ge && e->args[1] == zero) {
-    sum = e->args[0];
-  } else if (e->kind == Kind::Le && e->args[0] == zero) {
-    sum = e->args[1];
-  } else {
-    return nullptr;
+MaybeExpr NativeShapeEnv::maybe_fast_eval_comparison(const Expr& e) {
+  // Ge(sum, 0) and Le(0, sum) are both LessThan(0, sum).
+  if (!SymEngine::is_a<SymEngine::LessThan>(*e.get_basic())) {
+    return std::nullopt;
+  }
+  auto a = args(e);
+  if (a[0] != Expr(0)) {
+    return std::nullopt;
   }
   // _is_nonneg_sum.
-  auto nonneg_term = [&](const Expr* term) {
-    if (term->kind == Kind::Symbol) {
+  auto nonneg_term = [&](const Expr& term) {
+    if (is_symbol(term)) {
       auto it = var_to_range_.find(term);
       return it != var_to_range_.end() &&
-          compare_numbers(it->second.lower, zero) >= 0;
+          compare_numbers(it->second.lower, Expr(0)) >= 0;
     }
-    return term->is_number() && compare_numbers(term, zero) >= 0;
+    return is_number(term) && compare_numbers(term, Expr(0)) >= 0;
   };
-  bool nonneg = sum->kind == Kind::Add
-      ? std::all_of(sum->args.begin(), sum->args.end(), nonneg_term)
-      : nonneg_term(sum);
-  return nonneg ? arena_->boolean(true) : nullptr;
+  auto terms = SymEngine::is_a<SymEngine::Add>(*a[1].get_basic())
+      ? args(a[1])
+      : std::vector<Expr>{a[1]};
+  if (std::all_of(terms.begin(), terms.end(), nonneg_term)) {
+    return boolean(true);
+  }
+  return std::nullopt;
 }
 
-bool NativeShapeEnv::bound_lower_nonnegative(const Expr* e) {
+bool NativeShapeEnv::bound_lower_nonnegative(const Expr& e) {
   if (!pristine_ || !all_symbols_mirrored(e)) {
     throw NativeUnsupported("bound_sympy needs a pristine, mirrored env");
   }
-  // ShapeEnv.bound_sympy passes a range for every free symbol, so the
-  // TracingContext ranges do not matter.
-  const Expr* lower = bound_sympy(*arena_, e, var_to_range_).lower;
-  return compare_numbers(lower, arena_->integer(0)) >= 0;
+  const Expr lower = bound_sympy(e, var_to_range_, *symbols_).lower;
+  return compare_numbers(lower, Expr(0)) >= 0;
 }
 
-std::optional<const Expr*> NativeShapeEnv::static_eval(const Expr* e) {
+std::optional<MaybeExpr> NativeShapeEnv::static_eval(const Expr& e) {
   if (!pristine_ || !all_symbols_mirrored(e)) {
     return std::nullopt;
   }
-  const Expr* r = nullptr;
+  MaybeExpr r;
   try {
     r = maybe_evaluate_static(e);
   } catch (const NativeUnsupported&) {
@@ -465,8 +256,8 @@ std::optional<const Expr*> NativeShapeEnv::static_eval(const Expr* e) {
   return r;
 }
 
-std::optional<const Expr*> NativeShapeEnv::evaluate_expr(
-    const Expr* e,
+std::optional<MaybeExpr> NativeShapeEnv::evaluate_expr(
+    const Expr& e,
     const Hint& hint,
     std::optional<bool> fallback_value) {
   auto r = evaluate_expr_impl(e, hint);
@@ -476,27 +267,26 @@ std::optional<const Expr*> NativeShapeEnv::evaluate_expr(
   return r;
 }
 
-std::optional<const Expr*> NativeShapeEnv::evaluate_expr_impl(
-    const Expr* e,
+std::optional<MaybeExpr> NativeShapeEnv::evaluate_expr_impl(
+    const Expr& e,
     const Hint& hint) {
   // _evaluate_expr up to the static evaluation; the rest adds a guard or
   // raises.
-  if (e->kind == Kind::BooleanTrue || e->kind == Kind::BooleanFalse) {
-    return e;
+  if (as_bool(e)) {
+    return MaybeExpr(e);
   }
   // Python evaluates the replaced expr.
-  if (e->has_float || !replacements_empty_ || !all_symbols_mirrored(e)) {
+  if (!replacements_empty_ || !all_symbols_mirrored(e)) {
     return std::nullopt;
   }
-  if (e->is_number()) {
+  if (is_number(e)) {
     // Python asserts that e equals the hint (Integer(1) == True).
     if (std::holds_alternative<std::monostate>(hint)) {
-      return e;
+      return MaybeExpr(e);
     }
     const auto* i = std::get_if<int64_t>(&hint);
-    if (e->kind == Kind::Integer &&
-        e->p == (i ? *i : int64_t(std::get<bool>(hint)))) {
-      return e;
+    if (as_int64(e) == (i ? *i : int64_t(std::get<bool>(hint)))) {
+      return MaybeExpr(e);
     }
     return std::nullopt;
   }
@@ -505,15 +295,17 @@ std::optional<const Expr*> NativeShapeEnv::evaluate_expr_impl(
     return std::nullopt;
   }
   try {
-    if (const Expr* r = maybe_fast_eval_comparison(e)) {
+    if (MaybeExpr r = maybe_fast_eval_comparison(e)) {
       return r;
     }
-    if (const Expr* r = maybe_evaluate_static(e)) {
+    // Without a static answer Python guards on the hint.
+    if (MaybeExpr r = maybe_evaluate_static(e)) {
       return r;
     }
+    return std::nullopt;
   } catch (const NativeUnsupported&) {
+    return std::nullopt;
   }
-  return std::nullopt;
 }
 
 } // namespace torch::symbolic

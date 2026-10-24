@@ -2,6 +2,7 @@
 
 #include <torch/csrc/PyInterpreter.h>
 #include <torch/csrc/symbolic/Expr.h>
+#include <torch/csrc/symbolic/Functions.h>
 #include <torch/csrc/symbolic/NativeShapeEnv.h>
 #include <torch/csrc/symbolic/NativeSymNodeImpl.h>
 #include <torch/csrc/symbolic/PyFallback.h>
@@ -11,7 +12,13 @@
 
 #include <c10/core/impl/TorchDispatchModeTLS.h>
 
-#include <algorithm>
+#include <symengine/add.h>
+#include <symengine/infinity.h>
+#include <symengine/logic.h>
+#include <symengine/mul.h>
+#include <symengine/pow.h>
+#include <symengine/visitor.h>
+
 #include <array>
 #include <atomic>
 #include <optional>
@@ -27,57 +34,37 @@ namespace {
 // Mirrors whether torch._ops' process-global pre-dispatch PROXY slot is set.
 std::atomic<bool> pre_dispatch_proxy_set{false};
 
-constexpr Kind kFunctionKinds[] = {
-    Kind::Mod,
-    Kind::PythonMod,
-    Kind::FloorDiv,
-    Kind::CleanDiv,
-    Kind::Max,
-    Kind::Min,
-    Kind::PowByNatural,
-    Kind::FloatPow,
-    Kind::FloatTrueDiv,
-    Kind::IntTrueDiv,
-    Kind::CeilToInt,
-    Kind::FloorToInt,
-    Kind::TruncToInt,
-    Kind::RoundToInt,
-    Kind::RoundDecimal,
-    Kind::ToFloat,
-    Kind::TruncToFloat,
-    Kind::IsNonOverlappingAndDenseIndicator,
-    Kind::ModularIndexing,
-    Kind::BitwiseAnd,
-    Kind::BitwiseOr,
-    Kind::BitwiseXor,
-    Kind::Identity,
-    Kind::Where,
-    Kind::OpaqueSqrt,
-    Kind::OpaqueCos,
-    Kind::OpaqueCosh,
-    Kind::OpaqueSin,
-    Kind::OpaqueSinh,
-    Kind::OpaqueTan,
-    Kind::OpaqueTanh,
-    Kind::OpaqueAsin,
-    Kind::OpaqueAcos,
-    Kind::OpaqueAtan,
-    Kind::OpaqueExp,
-    Kind::OpaqueLog,
-    Kind::OpaqueAsinh,
-    Kind::OpaqueLog2};
+constexpr std::array kFunctions = {
+    Fn::FloorDiv,
+    Fn::CleanDiv,
+    Fn::Mod,
+    Fn::PythonMod,
+    Fn::PowByNatural,
+    Fn::IsNonOverlappingAndDenseIndicator,
+};
 
-// Python-side state for an ExprArena: the sympy Symbol objects that native
-// symbols came from and a conversion cache (conversion is pure per Expr).
+int64_t to_int64(py::handle obj) {
+  int overflow = 0;
+  long long v = PyLong_AsLongLongAndOverflow(obj.ptr(), &overflow);
+  if (overflow != 0) {
+    throw NativeUnsupported("integer overflow");
+  }
+  if (v == -1 && PyErr_Occurred()) {
+    throw py::error_already_set();
+  }
+  return v;
+}
+
+// Python-side state for a SymbolTable: the sympy classes, the sympy Symbols
+// that native symbols came from and a conversion cache.
 struct PyArena {
   PyArena() {
     py::module_ sympy = py::module_::import("sympy");
     py::module_ numbers = py::module_::import("torch.utils._sympy.numbers");
+    py::module_ functions = py::module_::import("torch.utils._sympy.functions");
     Integer = sympy.attr("Integer");
     Rational = sympy.attr("Rational");
-    Float = sympy.attr("Float");
     Symbol = sympy.attr("Symbol");
-    Dummy = sympy.attr("Dummy");
     Add = sympy.attr("Add");
     Mul = sympy.attr("Mul");
     Pow = sympy.attr("Pow");
@@ -91,46 +78,290 @@ struct PyArena {
     Not = sympy.attr("Not");
     And = sympy.attr("And");
     Or = sympy.attr("Or");
-    lattice_new =
-        py::module_::import("builtins")
-            .attr("super")(
-                py::module_::import("sympy.core.operations").attr("AssocOp"),
-                And)
-            .attr("__new__");
-    for (const char* name : {"Eq", "Ne", "Lt", "Le", "Gt", "Ge"}) {
-      relationals.push_back(sympy.attr(name));
-    }
-    py::module_ functions = py::module_::import("torch.utils._sympy.functions");
-    for (auto k : kFunctionKinds) {
-      function_classes.push_back(functions.attr(function_name(k)));
+    Eq = sympy.attr("Eq");
+    Ne = sympy.attr("Ne");
+    Lt = sympy.attr("Lt");
+    Le = sympy.attr("Le");
+    Gt = sympy.attr("Gt");
+    Ge = sympy.attr("Ge");
+    Max = functions.attr("Max");
+    Min = functions.attr("Min");
+    for (Fn fn : kFunctions) {
+      function_classes.push_back(functions.attr(function_name(fn)));
     }
   }
 
-  const Expr* from_sympy(py::handle obj);
-  py::object to_sympy(const Expr* e);
+  Expr from_sympy(py::handle obj);
+  // An integer range bound: an Integer or +-int_oo (sympy's oo included).
+  Expr bound_from_sympy(py::handle obj);
+  ValueRanges range_from_sympy(py::handle lower, py::handle upper) {
+    return ValueRanges(bound_from_sympy(lower), bound_from_sympy(upper));
+  }
+  py::object to_sympy(const Expr& e);
+  py::object to_sympy(const MaybeExpr& e) {
+    return e ? to_sympy(*e) : py::none();
+  }
 
-  c10::intrusive_ptr<ExprArena> arena = c10::make_intrusive<ExprArena>();
-  py::dict symbol_index;
-  std::vector<const Expr*> symbol_exprs;
-  std::vector<py::object> symbol_objects;
-  std::unordered_map<uint32_t, py::object> sympy_cache;
+  c10::intrusive_ptr<SymbolTable> symbols = c10::make_intrusive<SymbolTable>();
+  std::unordered_map<std::string, py::object> symbol_objects;
+  ExprMap<py::object> sympy_cache;
 
-  py::object Integer, Rational, Float, Symbol, Dummy, Add, Mul, Pow,
-      IntInfinity, NegativeIntInfinity, int_oo, oo, neg_oo, true_, false_, Not,
-      And, Or;
-  // super(AssocOp, cls).__new__, which LatticeOp.__new__ calls with the final
-  // ordered args.
-  py::object lattice_new;
-  // Indexed by Kind - Kind::Eq.
-  std::vector<py::object> relationals;
-  // Parallel to kFunctionKinds.
+  py::object Integer, Rational, Symbol, Add, Mul, Pow, IntInfinity,
+      NegativeIntInfinity, int_oo, oo, neg_oo, true_, false_, Not, And, Or, Eq,
+      Ne, Lt, Le, Gt, Ge, Max, Min;
+  // Parallel to kFunctions.
   std::vector<py::object> function_classes;
 };
 
-struct PyExpr {
-  std::shared_ptr<PyArena> owner;
-  const Expr* expr;
+// Builds the sympy expression of a SymEngine expression. bvisit is how
+// SymEngine's BaseVisitor dispatches, not a misspelled override of visit.
+// NOLINTBEGIN(bugprone-virtual-near-miss)
+class ToSympy : public SymEngine::BaseVisitor<ToSympy> {
+ public:
+  explicit ToSympy(PyArena& arena) : a_(&arena) {}
+
+  py::object apply(const Expr& e) {
+    auto it = a_->sympy_cache.find(e);
+    if (it != a_->sympy_cache.end()) {
+      return it->second;
+    }
+    e.get_basic()->accept(*this);
+    py::object r = std::move(result_);
+    a_->sympy_cache.emplace(e, r);
+    return r;
+  }
+
+  void bvisit(const SymEngine::Basic& x) {
+    throw NativeUnsupported("no sympy conversion for " + x.__str__());
+  }
+  void bvisit(const SymEngine::Integer& x) {
+    result_ = a_->Integer(int_to_py(x.as_integer_class()));
+  }
+  void bvisit(const SymEngine::Rational& x) {
+    result_ = a_->Rational(
+        int_to_py(x.get_num()->as_integer_class()),
+        int_to_py(x.get_den()->as_integer_class()));
+  }
+  void bvisit(const SymEngine::Infty& x) {
+    result_ = x.is_positive() ? a_->int_oo : a_->int_oo.attr("__neg__")();
+  }
+  void bvisit(const SymEngine::Symbol& x) {
+    auto it = a_->symbol_objects.find(x.get_name());
+    if (it != a_->symbol_objects.end()) {
+      result_ = it->second;
+      return;
+    }
+    // A symbol made natively; its facts are the sympy assumptions.
+    const SymbolFacts* f = a_->symbols->facts(Expr(x.rcp_from_this()));
+    py::dict assumptions;
+    if (f != nullptr) {
+      for (auto [name, v] :
+           {std::pair{"integer", f->integer},
+            std::pair{"nonnegative", f->nonnegative},
+            std::pair{"positive", f->positive}}) {
+        if (v) {
+          assumptions[name] = true;
+        }
+      }
+    }
+    result_ = a_->Symbol(x.get_name(), **assumptions);
+    a_->symbol_objects.emplace(x.get_name(), result_);
+  }
+  void bvisit(const SymEngine::Add& x) {
+    result_ = call(a_->Add, x);
+  }
+  void bvisit(const SymEngine::Mul& x) {
+    result_ = call(a_->Mul, x);
+  }
+  void bvisit(const SymEngine::Pow& x) {
+    result_ = call(a_->Pow, x);
+  }
+  void bvisit(const SymEngine::BooleanAtom& x) {
+    result_ = x.get_val() ? a_->true_ : a_->false_;
+  }
+  void bvisit(const SymEngine::Equality& x) {
+    result_ = call(a_->Eq, x, /*evaluate=*/false);
+  }
+  void bvisit(const SymEngine::Unequality& x) {
+    result_ = call(a_->Ne, x, /*evaluate=*/false);
+  }
+  // SymEngine keeps a > b as b < a; a number goes back on the right.
+  void bvisit(const SymEngine::LessThan& x) {
+    result_ = number_first(x) ? call(a_->Ge, x, false, true)
+                              : call(a_->Le, x, /*evaluate=*/false);
+  }
+  void bvisit(const SymEngine::StrictLessThan& x) {
+    result_ = number_first(x) ? call(a_->Gt, x, false, true)
+                              : call(a_->Lt, x, /*evaluate=*/false);
+  }
+  void bvisit(const SymEngine::Not& x) {
+    result_ = call(a_->Not, x);
+  }
+  void bvisit(const SymEngine::And& x) {
+    result_ = call(a_->And, x);
+  }
+  void bvisit(const SymEngine::Or& x) {
+    result_ = call(a_->Or, x);
+  }
+  void bvisit(const SymEngine::Max& x) {
+    result_ = call(a_->Max, x, /*evaluate=*/false);
+  }
+  void bvisit(const SymEngine::Min& x) {
+    result_ = call(a_->Min, x, /*evaluate=*/false);
+  }
+  void bvisit(const SymEngine::FunctionWrapper& x) {
+    const auto* f = dynamic_cast<const TorchFunction*>(&x);
+    if (f == nullptr) {
+      bvisit(static_cast<const SymEngine::Basic&>(x));
+      return;
+    }
+    size_t i = static_cast<size_t>(f->fn());
+    result_ = call(a_->function_classes.at(i), x, /*evaluate=*/false);
+  }
+
+ private:
+  static py::object int_to_py(const SymEngine::integer_class& i) {
+    if (SymEngine::mp_fits_slong_p(i)) {
+      return py::int_(SymEngine::mp_get_si(i));
+    }
+    std::string s = SymEngine::mp_get_hex_str(i);
+    PyObject* r = PyLong_FromString(s.c_str(), nullptr, 16);
+    if (r == nullptr) {
+      throw py::error_already_set();
+    }
+    return py::reinterpret_steal<py::object>(r);
+  }
+
+  static bool number_first(const SymEngine::Basic& x) {
+    const auto& xs = x.get_args();
+    return is_number(Expr(xs[0])) && !is_number(Expr(xs[1]));
+  }
+
+  py::object call(
+      const py::object& cls,
+      const SymEngine::Basic& x,
+      std::optional<bool> evaluate = std::nullopt,
+      bool reversed = false) {
+    const auto& xs = x.get_args();
+    py::tuple args(xs.size());
+    for (size_t i = 0; i < xs.size(); ++i) {
+      args[reversed ? xs.size() - 1 - i : i] = apply(Expr(xs[i]));
+    }
+    if (evaluate) {
+      return cls(*args, py::arg("evaluate") = *evaluate);
+    }
+    return cls(*args);
+  }
+
+  PyArena* a_;
+  py::object result_;
 };
+// NOLINTEND(bugprone-virtual-near-miss)
+
+py::object PyArena::to_sympy(const Expr& e) {
+  return ToSympy(*this).apply(e);
+}
+
+Expr PyArena::from_sympy(py::handle obj) {
+  auto from_args = [&]() {
+    std::vector<Expr> args;
+    for (py::handle a : obj.attr("args")) {
+      args.push_back(from_sympy(a));
+    }
+    return args;
+  };
+  auto exact = [&](const py::object& cls) {
+    return Py_TYPE(obj.ptr()) == reinterpret_cast<PyTypeObject*>(cls.ptr());
+  };
+  if (PyLong_CheckExact(obj.ptr()) || py::isinstance(obj, Integer)) {
+    return Expr(to_int64(py::int_(py::reinterpret_borrow<py::object>(obj))));
+  }
+  if (py::isinstance(obj, IntInfinity)) {
+    return symbolic::int_oo();
+  }
+  if (py::isinstance(obj, NegativeIntInfinity)) {
+    return symbolic::neg_int_oo();
+  }
+  if (py::isinstance(obj, Rational)) {
+    return Expr(SymEngine::Rational::from_two_ints(
+        to_int64(obj.attr("p")), to_int64(obj.attr("q"))));
+  }
+  // Dummy and Wild compare by more than the name.
+  if (exact(Symbol)) {
+    py::dict assumptions = obj.attr("assumptions0");
+    auto fact = [&](const char* name) {
+      return assumptions.contains(name) && assumptions[name].cast<bool>();
+    };
+    auto name = obj.attr("name").cast<std::string>();
+    Expr e = symbols->symbol(
+        name, {fact("integer"), fact("nonnegative"), fact("positive")});
+    symbol_objects.emplace(name, py::reinterpret_borrow<py::object>(obj));
+    return e;
+  }
+  if (py::isinstance(obj, Add)) {
+    return add(from_args());
+  }
+  if (py::isinstance(obj, Mul)) {
+    return mul(from_args());
+  }
+  if (py::isinstance(obj, Pow)) {
+    auto a = from_args();
+    return SymEngine::pow(a[0], a[1]);
+  }
+  if (obj.is(true_) || obj.is(false_)) {
+    return boolean(obj.is(true_));
+  }
+  for (auto [cls, kind] :
+       {std::pair{&Eq, Rel::Eq},
+        std::pair{&Ne, Rel::Ne},
+        std::pair{&Lt, Rel::Lt},
+        std::pair{&Le, Rel::Le},
+        std::pair{&Gt, Rel::Gt},
+        std::pair{&Ge, Rel::Ge}}) {
+    if (exact(*cls)) {
+      auto a = from_args();
+      return rel(kind, a[0], a[1], /*evaluate=*/false);
+    }
+  }
+  if (exact(Not)) {
+    return logical_not(from_args()[0]);
+  }
+  if (exact(And)) {
+    return logical_and(from_args());
+  }
+  if (exact(Or)) {
+    return logical_or(from_args());
+  }
+  if (exact(Max)) {
+    return sym_max(from_args());
+  }
+  if (exact(Min)) {
+    return sym_min(from_args());
+  }
+  for (size_t i = 0; i < function_classes.size(); ++i) {
+    // Exact type: CleanDiv subclasses FloorDiv.
+    if (exact(function_classes[i])) {
+      return function(kFunctions[i], from_args());
+    }
+  }
+  throw NativeUnsupported(
+      "unsupported sympy type " +
+      py::str(py::type::handle_of(obj).attr("__name__")).cast<std::string>());
+}
+
+Expr PyArena::bound_from_sympy(py::handle obj) {
+  if (obj.is(oo) || py::isinstance(obj, IntInfinity)) {
+    return symbolic::int_oo();
+  }
+  if (obj.is(neg_oo) || py::isinstance(obj, NegativeIntInfinity)) {
+    return symbolic::neg_int_oo();
+  }
+  Expr e = from_sympy(obj);
+  if (!is_integer(e)) {
+    throw NativeUnsupported("range bound that is not an integer");
+  }
+  return e;
+}
 
 // NativeShapeEnv::binding().
 struct EnvBinding {
@@ -144,7 +375,7 @@ struct EnvBinding {
 struct PyShapeEnv {
   PyShapeEnv(std::shared_ptr<PyArena> owner, const py::object& shape_env)
       : owner(std::move(owner)),
-        env(c10::make_intrusive<NativeShapeEnv>(this->owner->arena)) {
+        env(c10::make_intrusive<NativeShapeEnv>(this->owner->symbols)) {
     auto* binding = new EnvBinding{
         this->owner,
         shape_env.is_none() ? py::object(py::none())
@@ -162,27 +393,6 @@ struct PyShapeEnv {
   std::shared_ptr<PyArena> owner;
   c10::intrusive_ptr<NativeShapeEnv> env;
 };
-
-std::optional<Fact> fact_from_name(const std::string& name) {
-  for (size_t i = 0; i < kNumFacts; ++i) {
-    if (name == fact_name(static_cast<Fact>(i))) {
-      return static_cast<Fact>(i);
-    }
-  }
-  return std::nullopt;
-}
-
-int64_t to_int64(py::handle obj) {
-  int overflow = 0;
-  long long v = PyLong_AsLongLongAndOverflow(obj.ptr(), &overflow);
-  if (overflow != 0) {
-    throw NativeUnsupported("integer overflow");
-  }
-  if (v == -1 && PyErr_Occurred()) {
-    throw py::error_already_set();
-  }
-  return v;
-}
 
 // A None, int or bool hint; nullopt for any other, or an int that does not
 // fit.
@@ -202,485 +412,6 @@ std::optional<Hint> hint_from_py(py::handle hint) {
     return Hint();
   }
   return std::nullopt;
-}
-
-const Expr* PyArena::from_sympy(py::handle obj) {
-  if (PyLong_CheckExact(obj.ptr()) || py::isinstance(obj, Integer)) {
-    py::int_ v(py::reinterpret_borrow<py::object>(obj));
-    return arena->integer(to_int64(v));
-  }
-  if (py::isinstance(obj, Rational)) {
-    return arena->rational(to_int64(obj.attr("p")), to_int64(obj.attr("q")));
-  }
-  if (py::isinstance(obj, Float)) {
-    if (obj.attr("_prec").cast<int64_t>() != 53) {
-      throw NativeUnsupported("Float of precision other than 53");
-    }
-    auto v = obj.cast<double>();
-    // float() rounds Floats outside the doubles.
-    if (!Float(v).equal(obj)) {
-      throw NativeUnsupported("Float that is not a double");
-    }
-    return arena->float_number(v);
-  }
-  if (py::isinstance(obj, IntInfinity)) {
-    return arena->int_oo();
-  }
-  if (py::isinstance(obj, NegativeIntInfinity)) {
-    return arena->neg_int_oo();
-  }
-  // S.Infinity and S.NegativeInfinity are singletons.
-  if (obj.is(oo)) {
-    return arena->oo();
-  }
-  if (obj.is(neg_oo)) {
-    return arena->neg_oo();
-  }
-  // Exact type: Dummy/Wild compare by more than name and assumptions.
-  if (Py_TYPE(obj.ptr()) == reinterpret_cast<PyTypeObject*>(Symbol.ptr())) {
-    if (symbol_index.contains(obj)) {
-      return symbol_exprs.at(symbol_index[obj].cast<size_t>());
-    }
-    // sympy Symbol equality covers every assumption, so any assumption we do
-    // not track could merge distinct symbols.
-    Facts facts;
-    facts.fill(Tri::Unknown);
-    py::dict assumptions = obj.attr("assumptions0");
-    for (auto [k, v] : assumptions) {
-      auto name = k.cast<std::string>();
-      auto f = fact_from_name(name);
-      if (!f) {
-        throw NativeUnsupported("untracked assumption " + name);
-      }
-      facts[static_cast<size_t>(*f)] = v.cast<bool>() ? Tri::True : Tri::False;
-    }
-    const Expr* e = arena->symbol(obj.attr("name").cast<std::string>(), facts);
-    auto idx = static_cast<size_t>(e->p);
-    if (idx >= symbol_objects.size()) {
-      symbol_objects.resize(idx + 1);
-      symbol_exprs.resize(idx + 1);
-    }
-    symbol_objects[idx] = py::reinterpret_borrow<py::object>(obj);
-    symbol_exprs[idx] = e;
-    symbol_index[obj] = idx;
-    return e;
-  }
-  bool is_add = py::isinstance(obj, Add);
-  if (is_add || py::isinstance(obj, Mul)) {
-    std::vector<const Expr*> args;
-    for (py::handle a : obj.attr("args")) {
-      args.push_back(from_sympy(a));
-    }
-    // Only evaluate=False builds this; native construction would distribute.
-    if (!is_add && args.size() == 2 && args[0]->is_number() &&
-        args[1]->kind == Kind::Add) {
-      throw NativeUnsupported("unevaluated Mul(c, Add)");
-    }
-    return is_add ? arena->add(args) : arena->mul(args);
-  }
-  if (py::isinstance(obj, Pow)) {
-    py::tuple args = obj.attr("args");
-    return arena->pow(from_sympy(args[0]), from_sympy(args[1]));
-  }
-  if (obj.is(true_) || obj.is(false_)) {
-    return arena->boolean(obj.is(true_));
-  }
-  for (size_t i = 0; i < relationals.size(); ++i) {
-    if (Py_TYPE(obj.ptr()) ==
-        reinterpret_cast<PyTypeObject*>(relationals[i].ptr())) {
-      py::tuple args = obj.attr("args");
-      auto kind = static_cast<Kind>(static_cast<size_t>(Kind::Eq) + i);
-      return arena->rel(
-          kind, from_sympy(args[0]), from_sympy(args[1]), /*evaluate=*/false);
-    }
-  }
-  if (py::isinstance(obj, Not)) {
-    const Expr* a = from_sympy(py::tuple(obj.attr("args"))[0]);
-    const Expr* r = arena->logical_not(a);
-    if (r->kind != Kind::Not || r->args[0] != a) {
-      throw NativeUnsupported("unevaluated Not");
-    }
-    return r;
-  }
-  for (size_t i = 0; i < function_classes.size(); ++i) {
-    // Exact type: CleanDiv subclasses FloorDiv.
-    if (Py_TYPE(obj.ptr()) ==
-        reinterpret_cast<PyTypeObject*>(function_classes[i].ptr())) {
-      std::vector<const Expr*> args;
-      for (py::handle a : obj.attr("args")) {
-        args.push_back(from_sympy(a));
-      }
-      Kind kind = kFunctionKinds[i];
-      // A Max/Min is taken as is: _collapse_arguments leaves unevaluated
-      // ones in the args of evaluated ones.
-      const Expr* r = kind == Kind::Max || kind == Kind::Min
-          ? arena->minmax(kind, args, false)
-          : arena->function(kind, args);
-      if (r->kind != kind ||
-          !std::equal(
-              r->args.begin(), r->args.end(), args.begin(), args.end())) {
-        throw NativeUnsupported("unevaluated function");
-      }
-      return r;
-    }
-  }
-  for (auto kind : {Kind::And, Kind::Or}) {
-    py::handle cls = kind == Kind::And ? And : Or;
-    if (Py_TYPE(obj.ptr()) == reinterpret_cast<PyTypeObject*>(cls.ptr())) {
-      std::vector<const Expr*> args;
-      for (py::handle a : obj.attr("args")) {
-        args.push_back(from_sympy(a));
-      }
-      return arena->lattice_from_args(kind, args);
-    }
-  }
-  throw NativeUnsupported(
-      "unsupported sympy type " +
-      py::str(py::type::handle_of(obj).attr("__name__")).cast<std::string>());
-}
-
-py::object PyArena::to_sympy(const Expr* e) {
-  auto it = sympy_cache.find(e->id);
-  if (it != sympy_cache.end()) {
-    return it->second;
-  }
-  py::object r;
-  switch (e->kind) {
-    case Kind::Integer:
-      r = Integer(e->p);
-      break;
-    case Kind::Rational:
-      r = Rational(e->p, e->q);
-      break;
-    case Kind::Float:
-      r = Float(e->float_value());
-      break;
-    case Kind::IntInfinity:
-      r = int_oo;
-      break;
-    case Kind::NegativeIntInfinity:
-      r = int_oo.attr("__neg__")();
-      break;
-    case Kind::Infinity:
-      r = oo;
-      break;
-    case Kind::NegativeInfinity:
-      r = neg_oo;
-      break;
-    case Kind::Symbol: {
-      const SymbolInfo& info = arena->symbol_info(e);
-      if (info.dummy_index == 0) {
-        r = symbol_objects.at(e->p);
-        break;
-      }
-      py::dict assumptions;
-      for (size_t i = 0; i < kNumFacts; ++i) {
-        auto f = static_cast<Fact>(i);
-        if (info.facts.get(f) != Tri::Unknown) {
-          assumptions[fact_name(f)] = info.facts.get(f) == Tri::True;
-        }
-      }
-      r = Dummy(info.name, **assumptions);
-      break;
-    }
-    case Kind::Add:
-    case Kind::Mul:
-    case Kind::Pow: {
-      py::tuple args(e->args.size());
-      for (size_t i = 0; i < e->args.size(); ++i) {
-        args[i] = to_sympy(e->args[i]);
-      }
-      r =
-          (e->kind == Kind::Add       ? Add
-               : e->kind == Kind::Mul ? Mul
-                                      : Pow)(*args);
-      break;
-    }
-    case Kind::BooleanTrue:
-      r = true_;
-      break;
-    case Kind::BooleanFalse:
-      r = false_;
-      break;
-    case Kind::Eq:
-    case Kind::Ne:
-    case Kind::Lt:
-    case Kind::Le:
-    case Kind::Gt:
-    case Kind::Ge: {
-      py::object cls = relationals.at(
-          static_cast<size_t>(e->kind) - static_cast<size_t>(Kind::Eq));
-      r =
-          cls(to_sympy(e->args[0]),
-              to_sympy(e->args[1]),
-              py::arg("evaluate") = false);
-      break;
-    }
-    case Kind::Not:
-      r = Not(to_sympy(e->args[0]));
-      break;
-    case Kind::And:
-    case Kind::Or: {
-      py::tuple args(e->args.size());
-      for (size_t i = 0; i < e->args.size(); ++i) {
-        args[i] = to_sympy(e->args[i]);
-      }
-      // Rebuilding with Or(*args) could re-filter: Or's filter is not
-      // idempotent.
-      py::object cls = e->kind == Kind::And ? And : Or;
-      r = lattice_new(cls, *args);
-      r.attr("_argset") = py::frozenset(args);
-      break;
-    }
-    case Kind::Mod:
-    case Kind::PythonMod:
-    case Kind::FloorDiv:
-    case Kind::CleanDiv:
-    case Kind::Max:
-    case Kind::Min:
-    case Kind::PowByNatural:
-    case Kind::FloatPow:
-    case Kind::FloatTrueDiv:
-    case Kind::IntTrueDiv:
-    case Kind::CeilToInt:
-    case Kind::FloorToInt:
-    case Kind::TruncToInt:
-    case Kind::RoundToInt:
-    case Kind::RoundDecimal:
-    case Kind::ToFloat:
-    case Kind::TruncToFloat:
-    case Kind::IsNonOverlappingAndDenseIndicator:
-    case Kind::ModularIndexing:
-    case Kind::BitwiseAnd:
-    case Kind::BitwiseOr:
-    case Kind::BitwiseXor:
-    case Kind::Identity:
-    case Kind::Where:
-    case Kind::OpaqueSqrt:
-    case Kind::OpaqueCos:
-    case Kind::OpaqueCosh:
-    case Kind::OpaqueSin:
-    case Kind::OpaqueSinh:
-    case Kind::OpaqueTan:
-    case Kind::OpaqueTanh:
-    case Kind::OpaqueAsin:
-    case Kind::OpaqueAcos:
-    case Kind::OpaqueAtan:
-    case Kind::OpaqueExp:
-    case Kind::OpaqueLog:
-    case Kind::OpaqueAsinh:
-    case Kind::OpaqueLog2: {
-      py::tuple args(e->args.size());
-      for (size_t i = 0; i < e->args.size(); ++i) {
-        args[i] = to_sympy(e->args[i]);
-      }
-      auto* it = std::find(
-          std::begin(kFunctionKinds), std::end(kFunctionKinds), e->kind);
-      r = function_classes.at(it - std::begin(kFunctionKinds))(
-          *args, py::arg("evaluate") = false);
-      break;
-    }
-  }
-  sympy_cache.emplace(e->id, r);
-  return r;
-}
-
-const char* kind_name(Kind k) {
-  switch (k) {
-    case Kind::Integer:
-      return "Integer";
-    case Kind::Rational:
-      return "Rational";
-    case Kind::Float:
-      return "Float";
-    case Kind::IntInfinity:
-      return "IntInfinity";
-    case Kind::NegativeIntInfinity:
-      return "NegativeIntInfinity";
-    case Kind::Infinity:
-      return "Infinity";
-    case Kind::NegativeInfinity:
-      return "NegativeInfinity";
-    case Kind::Symbol:
-      return "Symbol";
-    case Kind::Pow:
-      return "Pow";
-    case Kind::Mul:
-      return "Mul";
-    case Kind::Add:
-      return "Add";
-    case Kind::BooleanTrue:
-      return "BooleanTrue";
-    case Kind::BooleanFalse:
-      return "BooleanFalse";
-    case Kind::Eq:
-      return "Eq";
-    case Kind::Ne:
-      return "Ne";
-    case Kind::Lt:
-      return "Lt";
-    case Kind::Le:
-      return "Le";
-    case Kind::Gt:
-      return "Gt";
-    case Kind::Ge:
-      return "Ge";
-    case Kind::Not:
-      return "Not";
-    case Kind::And:
-      return "And";
-    case Kind::Or:
-      return "Or";
-    case Kind::Mod:
-    case Kind::PythonMod:
-    case Kind::FloorDiv:
-    case Kind::CleanDiv:
-    case Kind::Max:
-    case Kind::Min:
-    case Kind::PowByNatural:
-    case Kind::FloatPow:
-    case Kind::FloatTrueDiv:
-    case Kind::IntTrueDiv:
-    case Kind::CeilToInt:
-    case Kind::FloorToInt:
-    case Kind::TruncToInt:
-    case Kind::RoundToInt:
-    case Kind::RoundDecimal:
-    case Kind::ToFloat:
-    case Kind::TruncToFloat:
-    case Kind::IsNonOverlappingAndDenseIndicator:
-    case Kind::ModularIndexing:
-    case Kind::BitwiseAnd:
-    case Kind::BitwiseOr:
-    case Kind::BitwiseXor:
-    case Kind::Identity:
-    case Kind::Where:
-    case Kind::OpaqueSqrt:
-    case Kind::OpaqueCos:
-    case Kind::OpaqueCosh:
-    case Kind::OpaqueSin:
-    case Kind::OpaqueSinh:
-    case Kind::OpaqueTan:
-    case Kind::OpaqueTanh:
-    case Kind::OpaqueAsin:
-    case Kind::OpaqueAcos:
-    case Kind::OpaqueAtan:
-    case Kind::OpaqueExp:
-    case Kind::OpaqueLog:
-    case Kind::OpaqueAsinh:
-    case Kind::OpaqueLog2:
-      return function_name(k);
-  }
-  return "?";
-}
-
-Kind relational_kind(const std::string& op) {
-  for (auto k : {Kind::Eq, Kind::Ne, Kind::Lt, Kind::Le, Kind::Gt, Kind::Ge}) {
-    if (op == kind_name(k)) {
-      return k;
-    }
-  }
-  TORCH_CHECK(false, "unknown relational ", op);
-}
-
-Kind function_kind(const std::string& name) {
-  for (auto k : kFunctionKinds) {
-    if (name == function_name(k)) {
-      return k;
-    }
-  }
-  TORCH_CHECK(false, "unknown function ", name);
-}
-
-const Expr* unwrap(const std::shared_ptr<PyArena>& self, const PyExpr& e) {
-  TORCH_CHECK(e.owner == self, "expression belongs to a different arena");
-  return e.expr;
-}
-
-py::object to_py(Tri t) {
-  if (t == Tri::Unknown) {
-    return py::none();
-  }
-  return py::bool_(t == Tri::True);
-}
-
-py::set fact_set(uint32_t true_mask, uint32_t false_mask) {
-  py::set r;
-  for (size_t i = 0; i < kNumFacts; ++i) {
-    for (bool v : {false, true}) {
-      if (((v ? true_mask : false_mask) >> i) & 1) {
-        r.add(py::make_tuple(fact_name(static_cast<Fact>(i)), v));
-      }
-    }
-  }
-  return r;
-}
-
-// _assume_rules as the Python structures sympy uses, for testing the tables.
-py::tuple assume_rules_to_py() {
-  AssumeRules rules = assume_rules();
-  py::dict implications;
-  py::dict triggers;
-  py::dict prereq;
-  for (size_t i = 0; i < kNumFacts; ++i) {
-    const char* name = fact_name(static_cast<Fact>(i));
-    for (bool v : {false, true}) {
-      const Implication& imp = rules.full_implications[i][v];
-      implications[py::make_tuple(name, v)] =
-          fact_set(imp.true_mask, imp.false_mask);
-      py::set t;
-      for (size_t b = 0; b < rules.beta_rules.size(); ++b) {
-        if ((rules.beta_triggers[i][v] >> b) & 1) {
-          t.add(py::int_(b));
-        }
-      }
-      triggers[py::make_tuple(name, v)] = t;
-    }
-    py::set pre;
-    for (size_t j = 0; j < kNumFacts; ++j) {
-      if ((rules.prereq[i] >> j) & 1) {
-        pre.add(py::str(fact_name(static_cast<Fact>(j))));
-      }
-    }
-    prereq[py::str(name)] = pre;
-  }
-  py::list beta;
-  for (const BetaRule& r : rules.beta_rules) {
-    beta.append(
-        py::make_tuple(
-            fact_set(r.cond_true, r.cond_false),
-            py::make_tuple(fact_name(r.fact), r.value)));
-  }
-  return py::make_tuple(implications, beta, triggers, prereq);
-}
-
-std::vector<const Expr*> unwrap_all(
-    const std::shared_ptr<PyArena>& self,
-    const std::vector<PyExpr>& es) {
-  std::vector<const Expr*> r;
-  r.reserve(es.size());
-  for (const auto& e : es) {
-    r.push_back(unwrap(self, e));
-  }
-  return r;
-}
-
-py::object sort_key_to_py(PyArena& arena, const SortKey& k) {
-  switch (k.type) {
-    case SortKey::Type::Int:
-      return py::int_(k.i);
-    case SortKey::Type::Str:
-      return py::str(k.s);
-    case SortKey::Type::Num:
-      return arena.to_sympy(k.num);
-    case SortKey::Type::Tuple:
-      break;
-  }
-  py::tuple t(k.items.size());
-  for (size_t i = 0; i < k.items.size(); ++i) {
-    t[i] = sort_key_to_py(arena, *k.items[i]);
-  }
-  return t;
 }
 
 // A torch.fx.experimental._config entry, read the way ConfigModule.__getattr__
@@ -795,7 +526,7 @@ bool expr_query(const NativeSymNodeImpl& node, const char* attr, F native) {
     NativeShapeEnv& env = *node.env();
     auto lock = lock_env(env);
     if (env.replacements_empty()) {
-      return native(env.arena(), node.expr());
+      return native(node.expr());
     }
   }
   return node_to_py(materialize(node)).attr("expr").attr(attr).cast<bool>();
@@ -863,6 +594,11 @@ bool native_config_is_default() {
       entries->aggressive.falsy(unset, hide_str);
 }
 
+std::string sympy_str(const NativeSymNodeImpl& node) {
+  py::gil_scoped_acquire gil;
+  return py::str(node_expr(node)).cast<std::string>();
+}
+
 void live_nodes_changed(NativeShapeEnv& env) {
   if (!Py_IsInitialized()) {
     return;
@@ -910,8 +646,7 @@ c10::SymNode materialize(const NativeSymNodeImpl& node) {
       pytype_to_py(node.pytype()),
       hint,
       py::arg("constant") = constant,
-      py::arg("fx_node") = constant,
-      py::arg("optimized_summation") = node.optimized_summation());
+      py::arg("fx_node") = constant);
   return c10::make_intrusive<impl::PythonSymNodeImpl>(std::move(r));
 }
 
@@ -950,8 +685,7 @@ void sym_register(
   auto python = [&] {
     proxy_tensor.attr("_sym_register")(tracer, op, wrapped, sym);
   };
-  if (out.expr()->kind == Kind::Symbol ||
-      tracer.attr("enable_thunkify").cast<bool>() ||
+  if (is_symbol(out.expr()) || tracer.attr("enable_thunkify").cast<bool>() ||
       log.attr("isEnabledFor")(debug).cast<bool>()) {
     return python();
   }
@@ -1063,10 +797,11 @@ c10::SymNode proxy_dispatch(
     return node_from_py(r.attr("node"));
   }
   PyObject* t = reinterpret_cast<PyObject*>(Py_TYPE(r.ptr()));
-  const char* wrap = t == reinterpret_cast<PyObject*>(&PyBool_Type) ? "wrap_bool"
-      : t == reinterpret_cast<PyObject*>(&PyLong_Type)             ? "wrap_int"
-      : t == reinterpret_cast<PyObject*>(&PyFloat_Type)            ? "wrap_float"
-                                                                   : nullptr;
+  const char* wrap = t == reinterpret_cast<PyObject*>(&PyBool_Type)
+      ? "wrap_bool"
+      : t == reinterpret_cast<PyObject*>(&PyLong_Type)  ? "wrap_int"
+      : t == reinterpret_cast<PyObject*>(&PyFloat_Type) ? "wrap_float"
+                                                        : nullptr;
   if (wrap == nullptr) {
     return node_from_py(py::handle(Py_NotImplemented));
   }
@@ -1097,7 +832,6 @@ void initSymbolicBindings(PyObject* module) {
   auto sm = m.def_submodule("_symbolic", "native symbolic expressions");
   py::register_exception<NativeUnsupported>(sm, "NativeUnsupported");
   initGlueBindings(sm);
-  sm.def("_assume_rules", &assume_rules_to_py);
   sm.def("_native_config_is_default", &native_config_is_default);
   sm.def("_native_queries_pending", &NativeShapeEnv::queries_pending);
   sm.def("_set_suppress_guards", [](bool v) { suppress_guards_tls() = v; });
@@ -1106,284 +840,46 @@ void initSymbolicBindings(PyObject* module) {
   sm.def("_roundtrip_symbool", [](const c10::SymBool& v) { return v; });
   sm.def("_roundtrip_symfloat", [](const c10::SymFloat& v) { return v; });
 
-  py::class_<PyExpr>(sm, "_Expr")
-      .def(
-          "__eq__",
-          [](const PyExpr& a, const PyExpr& b) {
-            return a.owner == b.owner && a.expr == b.expr;
-          })
-      .def(
-          "__hash__",
-          [](const PyExpr& a) { return std::hash<const Expr*>()(a.expr); })
-      .def_property_readonly(
-          "kind", [](const PyExpr& a) { return kind_name(a.expr->kind); })
-      .def_property_readonly("id", [](const PyExpr& a) { return a.expr->id; });
-
+  // Takes and returns sympy expressions; the native ones stay internal.
   using Self = std::shared_ptr<PyArena>;
-  auto wrap = [](const Self& self, const Expr* e) { return PyExpr{self, e}; };
-  py::class_<PyArena, Self> arena_cls(sm, "_Arena");
-  arena_cls.def(py::init<>())
-      .def("__len__", [](const Self& self) { return self->arena->size(); })
+  py::class_<PyArena, Self>(sm, "_Arena")
+      .def(py::init<>())
       .def(
-          "from_sympy",
-          [wrap](const Self& self, py::handle obj) {
-            return wrap(self, self->from_sympy(obj));
-          })
-      .def(
-          "to_sympy",
-          [](const Self& self, const PyExpr& e) {
-            return self->to_sympy(unwrap(self, e));
-          })
-      .def(
-          "integer",
-          [wrap](const Self& self, py::handle v) {
-            return wrap(self, self->arena->integer(to_int64(v)));
-          })
-      .def(
-          "rational",
-          [wrap](const Self& self, py::handle p, py::handle q) {
-            return wrap(self, self->arena->rational(to_int64(p), to_int64(q)));
-          })
-      .def(
-          "add",
-          [wrap](const Self& self, const std::vector<PyExpr>& args) {
-            return wrap(self, self->arena->add(unwrap_all(self, args)));
-          })
-      .def(
-          "mul",
-          [wrap](const Self& self, const std::vector<PyExpr>& args) {
-            return wrap(self, self->arena->mul(unwrap_all(self, args)));
-          })
-      .def(
-          "pow",
-          [wrap](const Self& self, const PyExpr& b, const PyExpr& e) {
-            return wrap(
-                self, self->arena->pow(unwrap(self, b), unwrap(self, e)));
-          })
-      .def(
-          "neg",
-          [wrap](const Self& self, const PyExpr& a) {
-            return wrap(self, self->arena->neg(unwrap(self, a)));
-          })
-      .def(
-          "sub",
-          [wrap](const Self& self, const PyExpr& a, const PyExpr& b) {
-            return wrap(
-                self, self->arena->sub(unwrap(self, a), unwrap(self, b)));
-          })
-      .def(
-          "boolean",
-          [wrap](const Self& self, bool v) {
-            return wrap(self, self->arena->boolean(v));
-          })
-      .def(
-          "rel",
-          [wrap](
-              const Self& self,
-              const std::string& op,
-              const PyExpr& lhs,
-              const PyExpr& rhs,
-              bool evaluate) {
-            return wrap(
-                self,
-                self->arena->rel(
-                    relational_kind(op),
-                    unwrap(self, lhs),
-                    unwrap(self, rhs),
-                    evaluate));
-          },
-          py::arg("op"),
-          py::arg("lhs"),
-          py::arg("rhs"),
-          py::arg("evaluate") = true)
-      .def(
-          "function",
-          [wrap](
-              const Self& self,
-              const std::string& name,
-              const std::vector<PyExpr>& args) {
-            return wrap(
-                self,
-                self->arena->function(
-                    function_kind(name), unwrap_all(self, args)));
-          })
-      .def(
-          "ceildiv",
-          [wrap](const Self& self, const PyExpr& a, const PyExpr& b) {
-            return wrap(
-                self, self->arena->ceildiv(unwrap(self, a), unwrap(self, b)));
-          })
-      .def(
-          "lshift",
-          [wrap](const Self& self, const PyExpr& a, const PyExpr& b) {
-            return wrap(
-                self, self->arena->lshift(unwrap(self, a), unwrap(self, b)));
-          })
-      .def(
-          "rshift",
-          [wrap](const Self& self, const PyExpr& a, const PyExpr& b) {
-            return wrap(
-                self, self->arena->rshift(unwrap(self, a), unwrap(self, b)));
-          })
-      .def(
-          "logical_not",
-          [wrap](const Self& self, const PyExpr& a) {
-            return wrap(self, self->arena->logical_not(unwrap(self, a)));
-          })
-      .def(
-          "logical_and",
-          [wrap](const Self& self, const std::vector<PyExpr>& args) {
-            return wrap(self, self->arena->logical_and(unwrap_all(self, args)));
-          })
-      .def(
-          "logical_or",
-          [wrap](const Self& self, const std::vector<PyExpr>& args) {
-            return wrap(self, self->arena->logical_or(unwrap_all(self, args)));
-          })
-      .def(
-          "is_eq",
-          [](const Self& self, const PyExpr& a, const PyExpr& b) {
-            return to_py(self->arena->is_eq(unwrap(self, a), unwrap(self, b)));
-          })
-      .def(
-          "is_ge",
-          [](const Self& self, const PyExpr& a, const PyExpr& b) {
-            return to_py(self->arena->is_ge(unwrap(self, a), unwrap(self, b)));
-          })
-      .def(
-          "args",
-          [wrap](const Self& self, const PyExpr& e) {
-            std::vector<PyExpr> r;
-            for (const Expr* a : unwrap(self, e)->args) {
-              r.push_back(wrap(self, a));
-            }
-            return r;
-          })
-      .def(
-          "value_range",
-          [wrap](
-              const Self& self,
-              const PyExpr& e,
-              const std::vector<std::tuple<PyExpr, PyExpr, PyExpr>>& ranges) {
-            RangeMap m;
-            for (const auto& [sym, lower, upper] : ranges) {
-              m.insert_or_assign(
-                  unwrap(self, sym),
-                  make_value_range(
-                      *self->arena, unwrap(self, lower), unwrap(self, upper)));
-            }
-            ValueRanges r = value_range_interp(*self->arena, unwrap(self, e), m);
-            return std::make_pair(wrap(self, r.lower), wrap(self, r.upper));
-          })
-      .def(
-          "bound_sympy",
-          [wrap](
-              const Self& self,
-              const PyExpr& e,
-              const std::vector<std::tuple<PyExpr, PyExpr, PyExpr>>& ranges,
-              const std::vector<std::tuple<PyExpr, PyExpr, PyExpr>>&
-                  context_ranges) {
-            auto to_map = [&](const auto& rs) {
-              RangeMap m;
-              for (const auto& [sym, lower, upper] : rs) {
-                m.insert_or_assign(
-                    unwrap(self, sym),
-                    make_value_range(
-                        *self->arena,
-                        unwrap(self, lower),
-                        unwrap(self, upper)));
-              }
-              return m;
-            };
-            RangeMap m = to_map(ranges);
-            RangeMap context = to_map(context_ranges);
-            ValueRanges r =
-                bound_sympy(*self->arena, unwrap(self, e), m, &context);
-            return std::make_pair(wrap(self, r.lower), wrap(self, r.upper));
-          },
-          py::arg("e"),
-          py::arg("ranges"),
-          py::arg("context_ranges") =
-              std::vector<std::tuple<PyExpr, PyExpr, PyExpr>>{})
-      .def(
-          "compare",
-          [](const Self& self, const PyExpr& a, const PyExpr& b) {
-            return self->arena->compare(unwrap(self, a), unwrap(self, b));
-          })
-      .def(
-          "sort_key",
-          [](const Self& self, const PyExpr& e) {
-            return sort_key_to_py(
-                *self, *self->arena->sort_key(unwrap(self, e)));
-          })
-      .def(
-          "ordered",
-          [wrap](const Self& self, const std::vector<PyExpr>& seq) {
-            std::vector<PyExpr> r;
-            for (const Expr* e : self->arena->ordered(unwrap_all(self, seq))) {
-              r.push_back(wrap(self, e));
-            }
-            return r;
-          })
-      .def(
-          "could_extract_minus_sign",
-          [](const Self& self, const PyExpr& e) {
-            return self->arena->could_extract_minus_sign(unwrap(self, e));
+          "roundtrip",
+          [](const Self& self, py::handle e) {
+            return self->to_sympy(self->from_sympy(e));
           })
       .def(
           "sstr",
-          [](const Self& self, const PyExpr& e) {
-            return self->arena->str(unwrap(self, e));
+          [](const Self& self, py::handle e) {
+            return SymEngine::str(*self->from_sympy(e).get_basic());
           })
       .def(
-          "ask",
-          [](const Self& self, const PyExpr& e, const std::string& fact) {
-            auto f = fact_from_name(fact);
-            TORCH_CHECK(f, "unknown assumption ", fact);
-            return to_py(self->arena->ask(unwrap(self, e), *f));
-          })
-      .def(
-          "diff",
-          [wrap](const Self& self, const PyExpr& e, const PyExpr& x) {
-            const Expr* s = unwrap(self, x);
-            TORCH_CHECK(s->kind == Kind::Symbol, "diff needs a symbol");
-            return wrap(self, self->arena->diff(unwrap(self, e), s));
-          })
-      .def(
-          "as_numer_denom",
-          [wrap](const Self& self, const PyExpr& e) {
-            auto [n, d] = self->arena->as_numer_denom(unwrap(self, e));
-            return std::make_pair(wrap(self, n), wrap(self, d));
-          })
-      .def(
-          "is_polynomial",
-          [](const Self& self, const PyExpr& e) {
-            return self->arena->is_polynomial(unwrap(self, e));
-          })
-      .def(
-          "monotonic_sign",
-          [wrap](const Self& self, const PyExpr& e) -> std::optional<PyExpr> {
-            const Expr* r = self->arena->monotonic_sign(unwrap(self, e));
-            if (r == nullptr) {
-              return std::nullopt;
+          "function",
+          [](const Self& self, const std::string& name, const py::list& args) {
+            auto fn = function_from_name(name);
+            TORCH_CHECK(fn, "unknown function ", name);
+            std::vector<Expr> a;
+            for (py::handle x : args) {
+              a.push_back(self->from_sympy(x));
             }
-            return wrap(self, r);
+            return self->to_sympy(function(*fn, a));
+          })
+      .def(
+          "bound_sympy",
+          [](const Self& self, py::handle e, const py::dict& ranges) {
+            RangeMap m;
+            for (auto [sym, range] : ranges) {
+              auto bounds = range.cast<py::tuple>();
+              m.insert_or_assign(
+                  self->from_sympy(sym),
+                  self->range_from_sympy(bounds[0], bounds[1]));
+            }
+            ValueRanges r = bound_sympy(self->from_sympy(e), m, *self->symbols);
+            return py::make_tuple(
+                self->to_sympy(r.lower), self->to_sympy(r.upper));
           });
-  arena_cls.def(
-      "xreplace",
-      [wrap](
-          const Self& self,
-          const PyExpr& e,
-          const std::vector<std::pair<PyExpr, PyExpr>>& rule) {
-        std::vector<std::pair<const Expr*, const Expr*>> reps;
-        for (const auto& [old, rep] : rule) {
-          reps.emplace_back(unwrap(self, old), unwrap(self, rep));
-        }
-        return wrap(self, self->arena->xreplace(unwrap(self, e), reps));
-      });
-  auto wrap_opt = [wrap](const Self& self, const Expr* e) {
-    return e ? std::optional<PyExpr>(wrap(self, e)) : std::nullopt;
-  };
+
   py::class_<PyShapeEnv>(sm, "NativeShapeEnv")
       .def(
           py::init<Self, const py::object&>(),
@@ -1392,25 +888,11 @@ void initSymbolicBindings(PyObject* module) {
       .def_property_readonly(
           "arena", [](const PyShapeEnv& self) { return self.owner; })
       .def_property_readonly(
-          "pristine", [](const PyShapeEnv& self) { return self.env->pristine(); })
-      .def(
-          "add_symbol",
-          [](PyShapeEnv& self,
-             const PyExpr& sym,
-             std::optional<int64_t> hint,
-             const PyExpr& lower,
-             const PyExpr& upper,
-             bool size_like) {
-            auto lock = lock_env(*self.env);
-            self.env->add_symbol(
-                unwrap(self.owner, sym),
-                hint,
-                make_value_range(
-                    *self.owner->arena,
-                    unwrap(self.owner, lower),
-                    unwrap(self.owner, upper)),
-                size_like);
-          })
+          "pristine",
+          [](const PyShapeEnv& self) { return self.env->pristine(); })
+      .def_property_readonly(
+          "replacements_empty",
+          [](const PyShapeEnv& self) { return self.env->replacements_empty(); })
       .def(
           "mirror_symbol",
           [](PyShapeEnv& self,
@@ -1418,43 +900,44 @@ void initSymbolicBindings(PyObject* module) {
              py::handle hint,
              py::handle lower,
              py::handle upper) {
-            // Takes sympy objects. A symbol that is not representable stays
-            // unmirrored, so every query mentioning it delegates.
+            // A symbol that is not representable stays unmirrored, so every
+            // query mentioning it delegates.
             PyArena& a = *self.owner;
             auto lock = lock_env(*self.env);
             try {
               self.env->add_symbol(
                   a.from_sympy(sym),
-                  to_int64(hint),
-                  make_value_range(
-                      *a.arena, a.from_sympy(lower), a.from_sympy(upper)),
-                  /*size_like=*/false);
+                  hint.is_none() ? std::nullopt
+                                 : std::optional<int64_t>(to_int64(hint)),
+                  a.range_from_sympy(lower, upper));
             } catch (const NativeUnsupported&) {
+              return;
             }
-          })
+          },
+          py::arg("sym"),
+          py::arg("hint"),
+          py::arg("lower"),
+          py::arg("upper"))
       .def(
           "mirrored",
           [](PyShapeEnv& self, py::handle sym) -> py::object {
-            std::optional<std::tuple<std::optional<int64_t>, ValueRanges, bool>>
-                m;
+            std::optional<std::pair<std::optional<int64_t>, ValueRanges>> m;
             auto lock = lock_env(*self.env);
             try {
               m = self.env->mirrored(self.owner->from_sympy(sym));
             } catch (const NativeUnsupported&) {
+              return py::none();
             }
             if (!m) {
               return py::none();
             }
-            auto& [hint, range, size_like] = *m;
+            auto& [hint, range] = *m;
             return py::make_tuple(
                 hint,
                 self.owner->to_sympy(range.lower),
                 self.owner->to_sympy(range.upper),
-                size_like);
+                false);
           })
-      .def_property_readonly(
-          "replacements_empty",
-          [](const PyShapeEnv& self) { return self.env->replacements_empty(); })
       // A copied or unpickled ShapeEnv gets no native env.
       .def(
           "__deepcopy__",
@@ -1462,23 +945,19 @@ void initSymbolicBindings(PyObject* module) {
       .def(
           "__reduce__",
           [](const PyShapeEnv&) {
-            return py::make_tuple(
-                py::type::of(py::none()), py::tuple());
+            return py::make_tuple(py::type::of(py::none()), py::tuple());
           })
       .def(
           "update_range",
           [](PyShapeEnv& self,
-             const PyExpr& sym,
-             const PyExpr& lower,
-             const PyExpr& upper) {
+             py::handle sym,
+             py::handle lower,
+             py::handle upper) {
             auto lock = lock_env(*self.env);
             flush_mod_memo(self);
             self.env->update_range(
-                unwrap(self.owner, sym),
-                make_value_range(
-                    *self.owner->arena,
-                    unwrap(self.owner, lower),
-                    unwrap(self.owner, upper)));
+                self.owner->from_sympy(sym),
+                self.owner->range_from_sympy(lower, upper));
           })
       .def(
           "mark_not_pristine",
@@ -1502,42 +981,43 @@ void initSymbolicBindings(PyObject* module) {
           })
       .def(
           "simplify",
-          [wrap](PyShapeEnv& self, const PyExpr& e) {
+          [](PyShapeEnv& self, py::handle e) {
             auto lock = lock_env(*self.env);
-            return wrap(self.owner, self.env->simplify(unwrap(self.owner, e)));
+            return self.owner->to_sympy(
+                self.env->simplify(self.owner->from_sympy(e)));
           })
       .def(
           "maybe_evaluate_static",
-          [wrap_opt](PyShapeEnv& self, const PyExpr& e) {
+          [](PyShapeEnv& self, py::handle e) {
             auto lock = lock_env(*self.env);
-            return wrap_opt(
-                self.owner,
-                self.env->maybe_evaluate_static(unwrap(self.owner, e)));
+            return self.owner->to_sympy(
+                self.env->maybe_evaluate_static(self.owner->from_sympy(e)));
           })
       .def(
           "static_eval",
-          [wrap_opt](PyShapeEnv& self, const PyExpr& e) {
+          [](PyShapeEnv& self, py::handle e) {
+            // (answered, result).
             auto lock = lock_env(*self.env);
-            auto r = self.env->static_eval(unwrap(self.owner, e));
-            return std::make_pair(
-                r.has_value(), wrap_opt(self.owner, r.value_or(nullptr)));
+            auto r = self.env->static_eval(self.owner->from_sympy(e));
+            return py::make_tuple(
+                r.has_value(), self.owner->to_sympy(r.value_or(std::nullopt)));
           })
       .def(
           "evaluate_expr",
-          [wrap_opt](
-              PyShapeEnv& self,
-              const PyExpr& e,
-              py::handle hint,
-              std::optional<bool> fallback_value) {
-            // Only None, int and bool hints are ported.
+          [](PyShapeEnv& self,
+             py::handle e,
+             py::handle hint,
+             std::optional<bool> fallback_value) -> py::object {
+            // The result, or None when not answered natively; only None, int
+            // and bool hints are native.
             auto h = hint_from_py(hint);
             if (!h || !native_config_is_default()) {
-              return std::optional<PyExpr>();
+              return py::none();
             }
             auto lock = lock_env(*self.env);
             auto r = self.env->evaluate_expr(
-                unwrap(self.owner, e), *h, fallback_value);
-            return wrap_opt(self.owner, r.value_or(nullptr));
+                self.owner->from_sympy(e), *h, fallback_value);
+            return self.owner->to_sympy(r.value_or(std::nullopt));
           },
           py::arg("e"),
           py::arg("hint") = py::none(),
@@ -1562,57 +1042,28 @@ void initSymbolicBindings(PyObject* module) {
               throw NativeUnsupported("hint overflows int64");
             }
             auto lock = lock_env(*self.env);
-            const Expr* e = self.owner->from_sympy(expr);
-            if (e->has_float) {
-              throw NativeUnsupported("Float in a native node");
-            }
+            Expr e = self.owner->from_sympy(expr);
             return c10::make_intrusive<NativeSymNodeImpl>(
                 self.env, e, is_bool ? PyType::Bool : PyType::Int, *h);
           })
-      .def(
-          "take_queries",
-          [](PyShapeEnv& self) {
-            // (seq, expr, evaluate, hint, fallback_value, suppress_guards,
-            // result) with sympy exprs.
-            PyArena& a = *self.owner;
-            py::list out;
-            auto lock = lock_env(*self.env);
-            for (const auto& [seq, q, result] : self.env->take_queries()) {
-              out.append(py::make_tuple(
-                  seq,
-                  a.to_sympy(q.expr),
-                  q.evaluate,
-                  hint_to_py(q.hint),
-                  q.fallback_value,
-                  q.suppress_guards,
-                  result ? a.to_sympy(result) : py::object(py::none())));
-            }
-            return out;
-          });
-  for (auto [name, fn] :
-       {std::pair{"as_ordered_terms", &ExprArena::as_ordered_terms},
-        std::pair{"as_ordered_factors", &ExprArena::as_ordered_factors}}) {
-    arena_cls.def(name, [wrap, fn](const Self& self, const PyExpr& e) {
-      std::vector<PyExpr> r;
-      for (const Expr* a : (self->arena.get()->*fn)(unwrap(self, e))) {
-        r.push_back(wrap(self, a));
-      }
-      return r;
-    });
-  }
-  for (auto [name, fn] :
-       {std::pair{"canonical", &ExprArena::canonical},
-        std::pair{"reversed", &ExprArena::reversed},
-        std::pair{"reversedsign", &ExprArena::reversedsign},
-        std::pair{"negated", &ExprArena::negated},
-        std::pair{"weak", &ExprArena::weak},
-        std::pair{"strict", &ExprArena::strict},
-        std::pair{"safe_expand", &ExprArena::safe_expand},
-        std::pair{"canonicalize_bool_expr", &ExprArena::canonicalize_bool_expr}}) {
-    arena_cls.def(name, [wrap, fn](const Self& self, const PyExpr& r) {
-      return wrap(self, (self->arena.get()->*fn)(unwrap(self, r)));
-    });
-  }
+      .def("take_queries", [](PyShapeEnv& self) {
+        // (seq, expr, evaluate, hint, fallback_value, suppress_guards,
+        // result) with sympy exprs.
+        PyArena& a = *self.owner;
+        py::list out;
+        auto lock = lock_env(*self.env);
+        for (const auto& [seq, q, result] : self.env->take_queries()) {
+          out.append(py::make_tuple(
+              seq,
+              a.to_sympy(q.expr),
+              q.evaluate,
+              hint_to_py(q.hint),
+              q.fallback_value,
+              q.suppress_guards,
+              a.to_sympy(result)));
+        }
+        return out;
+      });
 
   // Unlike the _SymNode methods it overrides, these take and return Python
   // SymNodes as well.
@@ -1640,21 +1091,17 @@ void initSymbolicBindings(PyObject* module) {
       .def_property_readonly(
           "_expr_is_number",
           [](const NativeSymNodeImpl& n) {
-            // Boolean kinds are not Exprs (Basic.is_number is False), and no
-            // numeric kind has a Boolean arg.
-            return expr_query(
-                n, "is_number", [](const ExprArena& a, const Expr* e) {
-                  return !e->is_boolean() && a.free_symbols(e).empty();
-                });
+            return expr_query(n, "is_number", [](const Expr& e) {
+              return !is_boolean(e) && free_symbols(e).empty();
+            });
           })
       .def_property_readonly(
           "_expr_is_Boolean",
           [](const NativeSymNodeImpl& n) {
             // BooleanAtom and BooleanFunction; Relational is not.
-            return expr_query(
-                n, "is_Boolean", [](const ExprArena& /*a*/, const Expr* e) {
-                  return e->is_boolean() && !e->is_relational();
-                });
+            return expr_query(n, "is_Boolean", [](const Expr& e) {
+              return is_boolean(e) && !is_relational(e);
+            });
           })
       .def_property_readonly(
           "hint",
@@ -1678,7 +1125,8 @@ void initSymbolicBindings(PyObject* module) {
           "pytype",
           [](const NativeSymNodeImpl& n) { return pytype_to_py(n.pytype()); })
       .def_property_readonly(
-          "_optimized_summation", &NativeSymNodeImpl::optimized_summation)
+          "_optimized_summation",
+          [](const NativeSymNodeImpl& /*n*/) { return false; })
       .def("maybe_as_int", &NativeSymNodeImpl::maybe_as_int)
       .def("str", &NativeSymNodeImpl::str)
       .def("statically_known_true", &NativeSymNodeImpl::statically_known_true)
@@ -1703,21 +1151,23 @@ void initSymbolicBindings(PyObject* module) {
           })
       // Every other SymNode method runs its Python impl with the native node
       // as self; those read only the attributes bound here.
-      .def("__getattr__", [](py::handle self, const std::string& name) {
-        py::handle cls = python_symnode_class();
-        py::object attr = cls.attr("__dict__").attr("get")(name);
-        bool dunder = name.size() > 4 && name.rfind("__", 0) == 0 &&
-            name.compare(name.size() - 2, 2, "__") == 0;
-        if (attr.is_none() || dunder) {
-          // @allow-raw-throw: getattr and hasattr need an AttributeError
-          throw py::attribute_error(
-              "'_NativeSymNode' object has no attribute '" + name + "'");
-        }
-        if (py::hasattr(attr, "__get__")) {
-          return attr.attr("__get__")(self, cls);
-        }
-        return attr;
-      })
+      .def(
+          "__getattr__",
+          [](py::handle self, const std::string& name) {
+            py::handle cls = python_symnode_class();
+            py::object attr = cls.attr("__dict__").attr("get")(name);
+            bool dunder = name.size() > 4 && name.rfind("__", 0) == 0 &&
+                name.compare(name.size() - 2, 2, "__") == 0;
+            if (attr.is_none() || dunder) {
+              // @allow-raw-throw: getattr and hasattr need an AttributeError
+              throw py::attribute_error(
+                  "'_NativeSymNode' object has no attribute '" + name + "'");
+            }
+            if (py::hasattr(attr, "__get__")) {
+              return attr.attr("__get__")(self, cls);
+            }
+            return attr;
+          })
       .def("__repr__", [](py::handle self) {
         return python_symnode_class().attr("__repr__")(self);
       });
@@ -1746,12 +1196,9 @@ void initSymbolicBindings(PyObject* module) {
         std::pair{"sym_or", &c10::SymNodeImpl::sym_or},
         std::pair{"and_", &c10::SymNodeImpl::sym_and},
         std::pair{"or_", &c10::SymNodeImpl::sym_or}}) {
-    node_cls.def(
-        name,
-        [fn](
-            NativeSymNodeImpl& self, py::handle other) {
-          return node_to_py((self.*fn)(node_from_py(other)));
-        });
+    node_cls.def(name, [fn](NativeSymNodeImpl& self, py::handle other) {
+      return node_to_py((self.*fn)(node_from_py(other)));
+    });
   }
   for (auto [name, fn] :
        {std::pair{"neg", &c10::SymNodeImpl::neg},

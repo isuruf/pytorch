@@ -304,6 +304,9 @@ if(USE_COREML_DELEGATE)
 endif()
 
 
+include(${TORCH_ROOT}/cmake/External/symengine.cmake)
+list(APPEND TORCH_PYTHON_LINK_LIBRARIES torch::symengine)
+
 add_library(torch_python SHARED ${TORCH_PYTHON_SRCS})
 torch_compile_options(torch_python)  # see cmake/public/utils.cmake
 torch_optimize_layout_if_enabled(
